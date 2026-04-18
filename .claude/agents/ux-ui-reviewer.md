@@ -32,7 +32,12 @@ When invoked, you must follow these steps:
    - **Design system adherence** — consistent with project direction, no deviations
 4. **Verify content accuracy** — user-provided details (phone numbers, addresses, business names, prices) must appear VERBATIM. Invented details replacing user-provided ones is a BLOCKING issue
 5. **Check OG meta tags** on published pages — `og:title`, `og:description`, `og:image`, `og:url`, `twitter:card`
-6. **Score and output** the structured JSON result
+6. **Scan for build-artifact / editor-chrome bloat (BLOCKING)** — these indicate the save pipeline leaked state that should never reach the DB:
+   - **Compiled Tailwind runtime CSS** — any `<style>` block containing `--tw-border-spacing-x`, `tailwindcss v3`, or `::backdrop{--tw-border-spacing`. This is the `cdn.tailwindcss.com` runtime dumping its compiled output; source HTML should only carry the `<script src="https://cdn.tailwindcss.com">` tag, never the compiled bytes.
+   - **Duplicate `<style>` blocks** — two or more identical or near-identical `<style>` blocks in `<head>` is a round-trip symptom, treat as BLOCKING.
+   - **CMS editor chrome** — classes `ng-dd-handle`, `ng-dd-ai-btn`, `ng-dd-section`, `ng-props-selected`, `ng-ai-hover`, `ng-ai-selected`; styles `<style id="ng-dd-style">`, `<style id="ng-ai-select-style">`, `<style id="ng-props-style">`; attributes `draggable="true"`, `contenteditable="true"`, `spellcheck="false"`, `style="outline: none;"`; stray ✨ sparkle characters orphaned in the content (from the "Redesign with AI" section button). Any occurrence is BLOCKING — surface the exact selector and a one-liner fix that points at `sanitize_page_html` in `modules/services/magnus_project_service.py`.
+   - **Ballooning file size** — if a page that should be ~1–3 KB of source weighs > 20 KB, inspect for the signatures above before assuming the design needs simplification.
+7. **Score and output** the structured JSON result
 
 **Best Practices:**
 - Score honestly. 7 = "solid, ship it." 5 = "needs work." Do not inflate
