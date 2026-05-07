@@ -3,7 +3,7 @@ name: magnus-pipeline-reviewer
 description: "Deep architectural review of the entire Magnus pipeline (36K+ LoC across 33 files). Analyzes modularity, error handling, security, credits, model routing, KB integration, and telemetry. Use when comprehensive Magnus review is needed."
 tools: Read, Grep, Glob, LS, Bash
 disallowedTools: Write, Edit, NotebookEdit
-model: opus
+model: haiku
 color: orange
 ---
 
@@ -229,7 +229,7 @@ Return ONLY this JSON structure:
 {
   "review_metadata": {
     "reviewer": "magnus-pipeline-reviewer",
-    "model": "opus",
+    "model": "haiku",
     "timestamp": "ISO-8601",
     "files_reviewed": 33,
     "total_loc": 36288,

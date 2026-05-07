@@ -3,7 +3,7 @@ name: ux-ui-reviewer
 description: "Reviews HTML/CSS deliverables for UX quality, accessibility, and design system compliance. Use PROACTIVELY after generating or modifying frontend pages, templates, or UI components."
 tools: Read, Grep, Glob, LS, Bash
 disallowedTools: Write, Edit, NotebookEdit
-model: sonnet
+model: haiku
 color: purple
 ---
 

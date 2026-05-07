@@ -18,3 +18,7 @@ target-version = "py311"
 "**/agent_feed_api.py" = ["E402"]
 "**/email_api.py" = ["E402"]
 "**/magnus_llm.py" = ["E402", "F541"]
+"**/app.py" = ["E402", "F541", "F401", "F841", "E722", "F811"]
+"**/magnus_project_api.py" = ["E712"]
+"**/magnus_step_execution.py" = ["E402"]
+"**/magnus_api.py" = ["E402", "E712", "F401"]

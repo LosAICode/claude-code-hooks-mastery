@@ -82,6 +82,14 @@ Thumbs.db
 .env.test.local
 .env.production.local
 
+# Runtime locks
+.claude/*.lock
+
+# Secrets (never commit)
+*api_keys*.json
+secrets.json
+credentials.json
+
 # Logs
 logs/
 *.log
