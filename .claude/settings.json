@@ -12,7 +12,10 @@
       "Write",
       "Edit",
       "Bash(chmod:*)",
-      "Bash(touch:*)"
+      "Bash(touch:*)",
+      "Bash(printing-press:*)",
+      "Bash(pp-*:*)",
+      "Bash(go:*)"
     ],
     "deny": []
   },
