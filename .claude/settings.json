@@ -171,7 +171,7 @@
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
     "superpowers@claude-plugins-official": true,
-    "context-mode@context-mode": true,
-    "claude-mem@thedotmack": true
+    "context-mode@context-mode": false,
+    "claude-mem@thedotmack": false
   }
 }

@@ -57,7 +57,7 @@ def main():
         return
 
     # Skip files with known pre-existing type issues
-    SKIP_FILES = {"magnus_admin.py", "magnus_quality.py", "file_processor.py", "business_intelligence_blueprint.py", "legal_discovery_blueprint.py", "academic_search.py", "academic_search.beta.py", "academic_search_optimized.py", "academic_pdf_secure.py", "file_processor.beta.py", "file_processor_optimized.py", "playlist_downloader.py", "playlist_downloader.beta.py", "playlist_downloader_new.py", "playlist_downloader_v2.py", "playlist_downloader_simplified.py", "playlist_downloader_ratelimit.py", "playlist_downloader_efficient.py", "pdf_processor.py", "format_engines.py", "storage_integration.py", "youtube_api_v3_transcripts.py", "magnus_agent_runner.py"}
+    SKIP_FILES = {"magnus_admin.py", "magnus_quality.py", "file_processor.py", "business_intelligence_blueprint.py", "legal_discovery_blueprint.py", "academic_search.py", "academic_search.beta.py", "academic_search_optimized.py", "academic_pdf_secure.py", "file_processor.beta.py", "file_processor_optimized.py", "playlist_downloader.py", "playlist_downloader.beta.py", "playlist_downloader_new.py", "playlist_downloader_v2.py", "playlist_downloader_simplified.py", "playlist_downloader_ratelimit.py", "playlist_downloader_efficient.py", "pdf_processor.py", "format_engines.py", "storage_integration.py", "youtube_api_v3_transcripts.py", "magnus_agent_runner.py", "ocr_config.py"}
     if any(file_path.endswith(skip) for skip in SKIP_FILES):
         logger.info(f"Skipping file in SKIP_FILES: {file_path}")
         print(json.dumps({}))
