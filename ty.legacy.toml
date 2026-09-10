@@ -1,0 +1,31 @@
+# ty type checker configuration — LEGACY tree only
+# https://docs.astral.sh/ty/configuration/
+#
+# Applied by .claude/hooks/validators/ty_validator.py to files OUTSIDE this repo (the
+# NeurogenServer legacy codebase the hook also guards). Dynamic typing there makes these
+# ten rules noise; silencing them globally in ty.toml had emptied the check for every new
+# file written in THIS repo, so they live here instead. Do not add them back to ty.toml.
+
+[rules]
+# PEP 723 inline-script dependencies are resolved at runtime by `uv run --script`
+unresolved-import = "ignore"
+# Ignore deprecated warnings (e.g., datetime.utcnow) in legacy codebases
+deprecated = "ignore"
+# Ignore unresolved-attribute false positives from dynamic typing in legacy code
+unresolved-attribute = "ignore"
+# Ignore invalid-parameter-default for legacy `param: type = None` patterns
+invalid-parameter-default = "ignore"
+# Ignore not-subscriptable false positives from dynamic union types
+not-subscriptable = "ignore"
+# Ignore invalid-argument-type false positives from dynamic typing
+invalid-argument-type = "ignore"
+# Ignore unresolved-reference in legacy code with dynamic globals
+unresolved-reference = "ignore"
+# Ignore invalid-assignment false positives from dict type narrowing
+invalid-assignment = "ignore"
+# Ignore unsupported-operator false positives from dynamic dict value types
+unsupported-operator = "ignore"
+# Ignore call-non-callable false positives from dynamic dict/getattr patterns
+call-non-callable = "ignore"
+# Ignore invalid-return-type false positives from dict cache patterns returning Optional
+invalid-return-type = "ignore"

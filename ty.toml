@@ -1,27 +1,12 @@
 # ty type checker configuration
 # https://docs.astral.sh/ty/configuration/
+#
+# This is the STRICT config for files in this repo. The ten legacy silences that used to
+# sit here (unresolved-attribute, invalid-argument-type, call-non-callable, ...) applied to
+# every file ty inspects and emptied the builder agent's PostToolUse type check; they now
+# live in ty.legacy.toml, which ty_validator.py applies only to files outside this repo.
 
 [rules]
 # Ignore unresolved imports for inline scripts that use PEP 723 uv script dependencies
 # These dependencies are declared in script metadata and resolved at runtime by `uv run --script`
 unresolved-import = "ignore"
-# Ignore deprecated warnings (e.g., datetime.utcnow) in legacy codebases
-deprecated = "ignore"
-# Ignore unresolved-attribute false positives from dynamic typing in legacy code
-unresolved-attribute = "ignore"
-# Ignore invalid-parameter-default for legacy `param: type = None` patterns
-invalid-parameter-default = "ignore"
-# Ignore not-subscriptable false positives from dynamic union types
-not-subscriptable = "ignore"
-# Ignore invalid-argument-type false positives from dynamic typing
-invalid-argument-type = "ignore"
-# Ignore unresolved-reference in legacy code with dynamic globals
-unresolved-reference = "ignore"
-# Ignore invalid-assignment false positives from dict type narrowing
-invalid-assignment = "ignore"
-# Ignore unsupported-operator false positives from dynamic dict value types
-unsupported-operator = "ignore"
-# Ignore call-non-callable false positives from dynamic dict/getattr patterns
-call-non-callable = "ignore"
-# Ignore invalid-return-type false positives from dict cache patterns returning Optional
-invalid-return-type = "ignore"

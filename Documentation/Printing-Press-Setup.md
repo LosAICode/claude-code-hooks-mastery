@@ -46,7 +46,7 @@ source ~/.bashrc
 # 2. Install Printing Press (pre-built binary — recommended)
 curl -sL "https://github.com/mvanhorn/cli-printing-press/releases/latest/download/cli-printing-press_linux_amd64.tar.gz" \
   -o /tmp/pp.tar.gz
-mkdir -p ~/go/bin && tar -xzf /tmp/pp.tar.gz -C /tmp/pp-extract
+mkdir -p ~/go/bin /tmp/pp-extract && tar -xzf /tmp/pp.tar.gz -C /tmp/pp-extract
 cp /tmp/pp-extract/printing-press ~/go/bin/ && chmod +x ~/go/bin/printing-press
 
 # Alternative: compile from source (needs ~2GB disk for Go build cache)

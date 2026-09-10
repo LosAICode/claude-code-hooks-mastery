@@ -14,12 +14,17 @@ Outputs JSON decision for Claude Code PostToolUse hook:
 """
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 # Logging setup - log file next to this script
 SCRIPT_DIR = Path(__file__).parent
+# Repo root: this script lives at <root>/.claude/hooks/validators/. CLAUDE_PROJECT_DIR
+# (set by Claude Code, and already used by settings.json) wins when present, so the
+# config resolves on any checkout, not only /opt/claude-code-hooks-mastery.
+REPO_ROOT = Path(os.environ.get("CLAUDE_PROJECT_DIR") or SCRIPT_DIR.parents[2]).resolve()
 LOG_FILE = SCRIPT_DIR / "ruff_validator.log"
 
 logging.basicConfig(
@@ -58,7 +63,9 @@ def main():
 
     # Skip files with known pre-existing lint issues
     SKIP_FILES = {"file_processor.py", "business_intelligence_blueprint.py", "legal_discovery_blueprint.py", "magnus_service.py", "academic_search.py", "academic_search.beta.py", "academic_search_optimized.py", "academic_pdf_secure.py", "file_processor.beta.py", "file_processor_optimized.py", "playlist_downloader.py", "playlist_downloader.beta.py", "playlist_downloader_new.py", "playlist_downloader_v2.py", "playlist_downloader_simplified.py", "playlist_downloader_ratelimit.py", "playlist_downloader_efficient.py", "pdf_processor.py", "format_engines.py", "storage_integration.py", "youtube_api_v3_transcripts.py", "web_scraper.py"}
-    if any(file_path.endswith(skip) for skip in SKIP_FILES):
+    # Exact basename match: a suffix test exempted every *_utils.py / *_app.py /
+    # *web_scraper.py anywhere in the tree from the check.
+    if Path(file_path).name in SKIP_FILES:
         logger.info(f"Skipping file in SKIP_FILES: {file_path}")
         print(json.dumps({}))
         return
@@ -67,10 +74,11 @@ def main():
     logger.info(f"Running: uvx ruff check {file_path}")
     try:
         result = subprocess.run(
-            ["uvx", "ruff", "check", "--config", "/opt/claude-code-hooks-mastery/ruff.toml", file_path],
+            ["uvx", "ruff", "check", "--config", str(REPO_ROOT / "ruff.toml"), file_path],
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=120,
+            check=False,  # a non-zero exit is the signal we read below, not an error
         )
 
         stdout = result.stdout.strip()

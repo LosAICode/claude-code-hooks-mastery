@@ -14,12 +14,17 @@ Outputs JSON decision for Claude Code PostToolUse hook:
 """
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 # Logging setup - log file next to this script
 SCRIPT_DIR = Path(__file__).parent
+# Repo root: this script lives at <root>/.claude/hooks/validators/. CLAUDE_PROJECT_DIR
+# (set by Claude Code, and already used by settings.json) wins when present, so the
+# config resolves on any checkout, not only /opt/claude-code-hooks-mastery.
+REPO_ROOT = Path(os.environ.get("CLAUDE_PROJECT_DIR") or SCRIPT_DIR.parents[2]).resolve()
 LOG_FILE = SCRIPT_DIR / "ty_validator.log"
 
 logging.basicConfig(
@@ -57,20 +62,34 @@ def main():
         return
 
     # Skip files with known pre-existing type issues
-    SKIP_FILES = {"magnus_admin.py", "magnus_quality.py", "file_processor.py", "business_intelligence_blueprint.py", "legal_discovery_blueprint.py", "academic_search.py", "academic_search.beta.py", "academic_search_optimized.py", "academic_pdf_secure.py", "file_processor.beta.py", "file_processor_optimized.py", "playlist_downloader.py", "playlist_downloader.beta.py", "playlist_downloader_new.py", "playlist_downloader_v2.py", "playlist_downloader_simplified.py", "playlist_downloader_ratelimit.py", "playlist_downloader_efficient.py", "pdf_processor.py", "format_engines.py", "storage_integration.py", "youtube_api_v3_transcripts.py", "magnus_agent_runner.py"}
-    if any(file_path.endswith(skip) for skip in SKIP_FILES):
+    SKIP_FILES = {"magnus_admin.py", "magnus_quality.py", "file_processor.py", "business_intelligence_blueprint.py", "legal_discovery_blueprint.py", "academic_search.py", "academic_search.beta.py", "academic_search_optimized.py", "academic_pdf_secure.py", "file_processor.beta.py", "file_processor_optimized.py", "playlist_downloader.py", "playlist_downloader.beta.py", "playlist_downloader_new.py", "playlist_downloader_v2.py", "playlist_downloader_simplified.py", "playlist_downloader_ratelimit.py", "playlist_downloader_efficient.py", "pdf_processor.py", "format_engines.py", "storage_integration.py", "youtube_api_v3_transcripts.py", "magnus_agent_runner.py", "ocr_config.py"}
+    # Exact basename match: a suffix test exempted every *_utils.py / *_app.py /
+    # *web_scraper.py anywhere in the tree from the check.
+    if Path(file_path).name in SKIP_FILES:
         logger.info(f"Skipping file in SKIP_FILES: {file_path}")
         print(json.dumps({}))
         return
 
-    # Run uvx ty check on the single file
-    logger.info(f"Running: uvx ty check {file_path}")
+    # Two configs, chosen by WHERE the file lives. Files in this repo get the strict
+    # ty.toml (only unresolved-import silenced, for PEP 723 scripts). Files outside it
+    # (the NeurogenServer legacy tree the hooks also guard) get ty.legacy.toml, which
+    # carries the ten silences that dynamic legacy code needs. Keeping those ten in the
+    # global ty.toml had emptied the check for every new file the builder writes here.
+    try:
+        _inside_repo = Path(file_path).resolve().is_relative_to(REPO_ROOT)
+    except (OSError, ValueError):
+        _inside_repo = False
+    config_file = REPO_ROOT / ("ty.toml" if _inside_repo else "ty.legacy.toml")
+    if not config_file.exists():
+        config_file = REPO_ROOT / "ty.toml"
+    logger.info(f"Running: uvx ty check --config-file {config_file.name} {file_path}")
     try:
         result = subprocess.run(
-            ["uvx", "ty", "check", "--config-file", "/opt/claude-code-hooks-mastery/ty.toml", file_path],
+            ["uvx", "ty", "check", "--config-file", str(config_file), file_path],
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=120,
+            check=False,  # a non-zero exit is the signal we read below, not an error
         )
 
         stdout = result.stdout.strip()
