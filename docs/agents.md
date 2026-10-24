@@ -12,7 +12,6 @@ Sub-agents are specialized Claude Code workers defined as markdown files in `.cl
 | Meta Agent | `meta-agent.md` | — | Generates new sub-agent configuration files from descriptions |
 | Printing Press Builder | `printing-press-builder.md` | sonnet | Generates CLIs from OpenAPI specs using CLI Printing Press factory |
 | LLM/AI Research | `llm-ai-agents-and-eng-research.md` | — | AI research specialist for latest LLM/agent news |
-| Hello World | `hello-world-agent.md` | — | Simple greeting agent for testing |
 | Work Completion Summary | `work-completion-summary.md` | — | TTS audio summaries of completed work |
 
 ## Team Agents
@@ -24,9 +23,11 @@ Located in `.claude/agents/team/`:
 | `builder.md` | Generic engineering agent for implementation tasks |
 | `validator.md` | Read-only validation agent for verifying completed work |
 
-## Crypto Agents
+## Parked Agents
 
-Located in `.claude/agents/crypto/`. Each has haiku/opus/sonnet variants:
+Parked 2026-10-24 in `.claude/agents-parked/` so they are not listed in every session's context (each
+listed agent costs tokens on every API call). Move a file back into `.claude/agents/` to use it.
+`hello-world-agent.md` and the crypto set (`crypto/`, haiku/opus/sonnet variants):
 
 - **Crypto Coin Analyzer** — Real-time market analysis for specific tickers
 - **Crypto Investment Plays** — Actionable investment opportunities with entry/exit strategies
