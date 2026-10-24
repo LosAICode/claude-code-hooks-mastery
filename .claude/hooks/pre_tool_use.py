@@ -81,6 +81,25 @@ def is_env_file_access(tool_name, tool_input):
     
     return False
 
+LARGE_READ_BYTES = 50_000
+NON_TEXT_SUFFIXES = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.ipynb'}
+
+def large_whole_file_read(tool_name, tool_input):
+    """
+    Return the size of a text file being Read whole (no offset/limit) when it is over LARGE_READ_BYTES.
+    Once read, a file is re-sent on every later call of the session.
+    """
+    if tool_name != 'Read' or tool_input.get('offset') or tool_input.get('limit') or tool_input.get('allow_large'):
+        return 0
+    path = Path(tool_input.get('file_path', ''))
+    if path.suffix.lower() in NON_TEXT_SUFFIXES:
+        return 0
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    return size if size > LARGE_READ_BYTES else 0
+
 def main():
     try:
         # Read JSON input from stdin
@@ -94,7 +113,19 @@ def main():
             print("BLOCKED: Access to .env files containing sensitive data is prohibited", file=sys.stderr)
             print("Use .env.sample for template files instead", file=sys.stderr)
             sys.exit(2)  # Exit code 2 blocks tool call and shows error to Claude
-        
+
+        # Block whole-file reads of large files (they ride along on every later call)
+        size = large_whole_file_read(tool_name, tool_input)
+        if size:
+            file_path = tool_input.get('file_path', '')
+            print(f"BLOCKED: {file_path} is {size // 1000} KB; a whole-file Read stays in context for the rest "
+                  f"of the session.", file=sys.stderr)
+            print("Grep for the lines you need, then Read with offset/limit; or ask about the file without "
+                  f"reading it: python3 /opt/claude-code-hooks-mastery/scripts/rlm.py \"<question>\" {file_path}",
+                  file=sys.stderr)
+            print("If the whole file is truly needed, Read again with allow_large: true.", file=sys.stderr)
+            sys.exit(2)
+
         # Check for dangerous rm -rf commands
         if tool_name == 'Bash':
             command = tool_input.get('command', '')
