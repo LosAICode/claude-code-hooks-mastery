@@ -11,7 +11,7 @@ All hooks are UV single-file Python scripts in `.claude/hooks/`. They receive JS
 | `setup.py` | Setup | Init/maintenance tasks at project setup |
 | `session_start.py` | SessionStart | Runs on startup, resume, or `/clear` |
 | `session_end.py` | SessionEnd | Cleanup on exit, SIGINT, or error |
-| `pre_tool_use.py` | PreToolUse | Validates tool calls before execution. Blocks dangerous commands (`rm -rf`, `.env` access) |
+| `pre_tool_use.py` | PreToolUse | Validates tool calls before execution. Blocks dangerous commands (`rm -rf`, `.env` access) and whole-file Reads over 50 KB (use `/rlm`, see [rlm.md](rlm.md)) |
 | `post_tool_use.py` | PostToolUse | Logs and formats tool results after execution |
 | `post_tool_use_failure.py` | PostToolUseFailure | Handles tool execution failures |
 | `user_prompt_submit.py` | UserPromptSubmit | Processes user input. Flags: `--log-only`, `--store-last-prompt`, `--name-agent` |
