@@ -3,6 +3,9 @@
 **Updated**: 2026-10-24 | **Code**: `scripts/rlm.py`, `/rlm` (`.claude/commands/rlm.md`), the large-Read guard in
 `.claude/hooks/pre_tool_use.py` | **Commits**: `585e18d` (this repo), `97b24bf52` (NeuroGenServer `CLAUDE.md`)
 
+**Field guide (page with copyable recipes)**: https://claude.ai/artifact/HqBZ1TFHSJ4ppJ1G4Pc1aQ | **Token-waste audit
+prompt (Fable 5)**: `docs/prompts/Token-Waste-Audit-Fable5-Prompt-2026-10-24.md`
+
 RLM (Recursive Language Model) answers a question about big files or logs without loading them into the session.
 It is the same design NeuroGen uses for chat file analysis (`modules/services/session_rlm_service.py`), after
 Zhang, Kraska & Khattab, *Recursive Language Models* (arXiv:2512.24601). The paper author's reference
