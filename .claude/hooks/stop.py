@@ -22,6 +22,15 @@ except ImportError:
     pass  # dotenv is optional
 
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import stop_gate, track
+except Exception:  # the session tracker must never break this hook
+    def stop_gate(payload):
+        return None
+    def track(event, payload):
+        return None
+
 def get_completion_messages():
     """Return list of friendly completion messages."""
     return [
@@ -164,6 +173,10 @@ def main():
         
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
+        track("Stop", input_data)
+        board_gate = stop_gate(input_data)
+        if board_gate:
+            print(json.dumps(board_gate))
 
         # Extract required fields
         session_id = input_data.get("session_id", "")

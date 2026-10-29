@@ -8,10 +8,18 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
 def main():
     try:
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
+        track("PostToolUse", input_data)
         
         # Ensure log directory exists
         log_dir = Path.cwd() / 'logs'

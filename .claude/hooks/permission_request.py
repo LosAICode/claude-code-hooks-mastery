@@ -82,6 +82,13 @@ SAFE_BASH_COMMANDS = [
 ]
 
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
 def is_safe_bash_command(command: str) -> bool:
     """
     Check if a bash command is safe (read-only).
@@ -246,6 +253,7 @@ def main():
 
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
+        track("PermissionRequest", input_data)
 
         # Extract fields
         tool_name = input_data.get("tool_name", "")

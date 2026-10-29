@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to ~/.claude/session-tracker/config.json (or point SESSION_TRACKER_CONFIG at it). Keep project paths there, not in this repo.",
+  "deploy_patterns": [
+    "scripts/deploy\\.sh",
+    "systemctl\\s+restart\\s+myapp"
+  ],
+  "board_gate": {
+    "repo": "/path/to/project",
+    "branch": "main",
+    "board": "docs/Status-Board.md",
+    "code_paths": ["src/"],
+    "message": "Update your row in {board} (state, last commit, next) and commit it with a pathspec."
+  },
+  "session_log": {
+    "source": "/path/to/this/repo/reports/STATUS.md",
+    "dest": "/path/to/project/docs/Session-Log.md"
+  }
+}

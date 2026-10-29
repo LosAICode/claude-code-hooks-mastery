@@ -8,6 +8,13 @@ import sys
 import re
 from pathlib import Path
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
 def is_dangerous_rm_command(command):
     """
     Comprehensive detection of dangerous rm commands.
@@ -107,6 +114,8 @@ def main():
         
         tool_name = input_data.get('tool_name', '')
         tool_input = input_data.get('tool_input', {})
+        if tool_name == 'AskUserQuestion':
+            track("PreToolUse", input_data)
         
         # Check for .env file access (blocks access to sensitive environment files)
         if is_env_file_access(tool_name, tool_input):

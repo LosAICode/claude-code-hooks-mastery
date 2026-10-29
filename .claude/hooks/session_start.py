@@ -21,6 +21,13 @@ except ImportError:
     pass  # dotenv is optional
 
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
 def log_session_start(input_data):
     """Log session start event to logs directory."""
     # Ensure logs directory exists
@@ -153,6 +160,7 @@ def main():
         
         # Read JSON input from stdin
         input_data = json.loads(sys.stdin.read())
+        track("SessionStart", input_data)
         
         # Extract fields
         session_id = input_data.get('session_id', 'unknown')

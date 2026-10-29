@@ -21,6 +21,13 @@ except ImportError:
     pass  # dotenv is optional
 
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
 def get_tts_script_path():
     """
     Determine which TTS script to use based on available API keys.
@@ -91,6 +98,7 @@ def main():
         
         # Read JSON input from stdin
         input_data = json.loads(sys.stdin.read())
+        track("Notification", input_data)
         
         # Ensure log directory exists
         import os
