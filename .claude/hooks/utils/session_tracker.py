@@ -488,6 +488,8 @@ def prompt_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None, 
 
     pc = importlib.import_module(_PROMPT_CENTER_MODULE)
     rel = str(session["prompt_file"])
+    if not (Path(str(spec["repo"])) / rel).exists():  # filed under Completed/ or Pending/ since the claim
+        rel = pc.moved_map(spec).get(rel, rel)
     meta, _, _ = pc.parse_frontmatter(pc._read_head(Path(str(spec["repo"])) / rel))
     if meta.get("status") != "running" or str(meta.get("session_id") or "") != str(session.get("session_id")):
         return None

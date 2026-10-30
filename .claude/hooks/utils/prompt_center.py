@@ -143,6 +143,8 @@ MARKS = {"pending": "⚪", "running": "▶", "stalled": "▶?", "on-branch": "�
          "done": "🟢", "blocked": "🔴", "skipped": "—", "superseded": "—"}
 FINISHED = ("done", "deployed")
 NOT_COUNTED = ("skipped", "superseded")
+CLOSED = ("done", "skipped", "superseded")  # a prompt nobody runs again: filed under COMPLETED_FOLDER
+COMPLETED_FOLDER, PENDING_FOLDER = "Completed", "Pending"
 INDEX_NAME = re.compile(r"^(?:[A-Za-z-]+-)?00-README\.md$|^README\.md$", re.IGNORECASE)
 _ID = re.compile(r"^[A-Z]{0,2}\d+[a-z]?$")
 _TITLE_PREFIX = re.compile(r"^(?:Session prompt\b[^:]*:\s*)?(?:(?:[A-Za-z]+\s+)?[A-Z]{0,2}\d+[a-z]?(?:-\d+)?(?:\s*\([^)]*\))?:\s*)?")
@@ -231,6 +233,8 @@ def load_prompt(path: Path, rel: str, module: str | None, legacy: bool, aliases:
     status = str(meta.get("status") or "pending")
     if status not in STATUSES:
         status = "pending"
+    if path.parent.name.lower() == COMPLETED_FOLDER.lower() and status not in CLOSED:
+        status = "done"  # filed under Completed/: done, whatever an older frontmatter says
     return Prompt(path=path, rel=rel, module=mod, id=ident, order=str(meta.get("order") or ident or ""), legacy=legacy,
                   title=str(meta.get("title") or _title(body)), meta=meta, status=status, has_frontmatter=had)
 
@@ -257,7 +261,7 @@ def scan(cfg: dict[str, Any]) -> list[Prompt]:
     aliases = dict(spec.get("module_aliases") or {})
     seen: dict[str, tuple[tuple, Prompt]] = {}
 
-    def add(path: Path, module: str | None, legacy: bool, depth: int = 0) -> None:
+    def add(path: Path, module: str | None, legacy: bool, depth: int = 0, top: str | None = None) -> None:
         if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".md":
             return
         if INDEX_NAME.match(path.name) or path.name.startswith("_"):
@@ -266,7 +270,7 @@ def scan(cfg: dict[str, Any]) -> list[Prompt]:
             prompt = load_prompt(path, str(path.relative_to(repo)), module, legacy, aliases)
         except OSError:
             return
-        folder = path.parent.name
+        folder = top or path.parent.name
         rank = (prompt.has_frontmatter, not legacy, folder == folder.lower(), -depth)
         key = _twin_key(path.name)
         if key not in seen or rank > seen[key][0]:
@@ -282,9 +286,9 @@ def scan(cfg: dict[str, Any]) -> list[Prompt]:
                 for path in sorted(folder.iterdir()):
                     if path.is_dir() and not path.name.startswith("_") and not path.is_symlink():
                         for sub in sorted(path.iterdir()):
-                            add(sub, module_of(folder), False, depth=1)
+                            add(sub, module_of(folder), False, depth=1, top=folder.name)
                     else:
-                        add(path, module_of(folder), False)
+                        add(path, module_of(folder), False, top=folder.name)
     for pattern in spec.get("legacy_globs") or []:
         for folder in sorted(repo.glob(str(pattern))):
             if folder.is_dir():
@@ -301,6 +305,81 @@ def _order_key(order: str | None) -> tuple:
 # --- which prompt does a message name? ---------------------------------------------------------------
 
 _PATH_TOKEN = re.compile(r"(?:~|\.{0,2}/|\b)[\w.~/-]*/[\w.-]+\.md\b")
+
+
+def module_folder(spec: dict[str, Any], module: str) -> Path | None:
+    """The existing folder under the root for a module key (``Agents/`` for ``agents``, an alias folder), or None.
+
+    Several twins: the capitalized one wins (the owner names folders; tools follow).
+    """
+    spec = _spec(spec)
+    root = Path(str(spec["repo"])) / str(spec["root"])
+    aliases = dict(spec.get("module_aliases") or {})
+    if not root.is_dir():
+        return None
+    hits = [f for f in sorted(root.iterdir()) if f.is_dir() and not f.is_symlink() and not f.name.startswith("_")
+            and (_alias(f.name, aliases) or f.name.lower()) == module]
+    return min(hits, key=lambda f: f.name == f.name.lower()) if hits else None
+
+
+def status_folder(status: str) -> str:
+    return COMPLETED_FOLDER if status in CLOSED else PENDING_FOLDER
+
+
+def record_move(spec: dict[str, Any], old: str, new: str) -> str:
+    """Add ``old → new`` to ``_moved.json`` and repoint every entry that led to ``old`` (lookups stay one hop).
+
+    Returns the map's repo-relative path.
+    """
+    spec = _spec(spec)
+    rel = str(Path(str(spec["root"])) / "_moved.json")
+    data = moved_map(spec)
+    data = {k: (new if v == old else v) for k, v in data.items()}
+    data[old] = new
+    data = {k: v for k, v in data.items() if k != v and k != new}
+    path = Path(str(spec["repo"])) / rel
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(dict(sorted(data.items())), indent=1, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+    return rel
+
+
+def place(spec: dict[str, Any], rel: str, status: str) -> tuple[str, list[str]]:
+    """File a prompt under ``<module folder>/Completed/`` or ``/Pending/`` by status (``git mv`` when tracked).
+
+    Returns (its path now, the repo-relative paths a commit must name). Module READMEs, files outside the
+    root's module folders and files already in place are left alone: (rel, []). Raises OSError when the
+    target exists.
+    """
+    import subprocess
+
+    spec = _spec(spec)
+    repo = Path(str(spec["repo"]))
+    root = repo / str(spec["root"])
+    path = repo / rel
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return rel, []
+    if len(parts) < 2 or parts[0].startswith("_") or INDEX_NAME.match(path.name) or not path.is_file():
+        return rel, []
+    target = root / parts[0] / status_folder(status) / path.name
+    if target == path:
+        return rel, []
+    if target.exists():
+        raise OSError(f"{target.relative_to(repo)} already exists; not moving {rel}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    new = str(target.relative_to(repo))
+    tracked = False
+    try:
+        tracked = subprocess.run(["git", "-C", str(repo), "mv", "--", rel, new], capture_output=True,
+                                 timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not tracked:
+        os.replace(path, target)
+    moved_rel = record_move(spec, rel, new)
+    return new, ([rel] if tracked else []) + [new, moved_rel]
 
 
 def moved_map(spec: dict[str, Any]) -> dict[str, str]:

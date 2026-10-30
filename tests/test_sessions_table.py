@@ -43,3 +43,32 @@ def test_render_has_summary_task_branch_and_commit():
 
 def test_empty_table():
     assert "(no sessions)" in sessions.render([], NOW)
+
+
+def test_prompt_column_shows_module_and_id():
+    rows = [s("12345678abcdef", "working", 30, task="Run x", prompt_file="docs/P/Alpha/Alpha-A1-First.md"),
+            s("87654321", "idle", 90, prompt_file="docs/P/Alpha/Unknown-File.md"), s("abcdabcd", "idle", 99)]
+    labels = {"docs/P/Alpha/Alpha-A1-First.md": "alpha/A1"}
+    out = sessions.render(rows, NOW, labels)
+    header = out.splitlines()[2]
+    assert header.index("task") < header.index("prompt") < header.index("worktree")
+    lines = out.splitlines()
+    assert "alpha/A1" in lines[3] and "Unknown-File.md" in lines[4]
+
+
+def test_loader_is_the_prompt_center_one():
+    import prompt_center
+
+    assert sessions.load_sessions is prompt_center.load_sessions
+    assert not hasattr(sessions, "load_all")
+
+
+def test_prompt_labels_follow_moved_paths():
+    class P:
+        def __init__(self, rel, module, ident, name):
+            self.rel, self.module, self.id, self.name = rel, module, ident, name
+
+    index = [P("docs/P/Alpha/Completed/Alpha-A1-First.md", "alpha", "A1", "Alpha-A1-First.md")]
+    moved = {"docs/P/Alpha/Alpha-A1-First.md": "docs/P/Alpha/Completed/Alpha-A1-First.md"}
+    labels = sessions.prompt_labels(["docs/P/Alpha/Alpha-A1-First.md", "docs/P/x.md"], index, moved)
+    assert labels == {"docs/P/Alpha/Alpha-A1-First.md": "alpha/A1"}

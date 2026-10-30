@@ -9,9 +9,10 @@ which wait on the owner. The data is the prompt files themselves plus the sessio
 ```
 <repo>/<prompts.root>/                 e.g. docs/Prompts/
   README.md                            the board: intro + a generated block between <!-- status:begin/end -->
-  _moved.json                          old path → new path for prompts moved in by `migrate`
-  <module>/<Module>-00-README.md       the module index: free text + a generated status table between the markers
-  <module>/<Module>-<ID>-<Title>.md    one prompt = one session; its status lives in frontmatter
+  _moved.json                          old path → new path for every prompt moved (`migrate`, `set`, `sort`), one hop
+  <Module>/<Module>-00-README.md       the module index: free text + a generated status table between the markers
+  <Module>/<Module>-<ID>-<Title>.md    one prompt = one session; its status lives in frontmatter
+  <Module>/Pending/…  <Module>/Completed/…   with `status_folders` on: open prompts / done, skipped, superseded
   _batches/<date>-00-README.md         cross-module batch indexes moved in by `migrate`
 ```
 
@@ -23,7 +24,16 @@ the next token (`Funnels-B12-3-…` → `B12-3`, `01-Sock-…` → `01`). A file
 
 The same prompt saved twice counts once: a legacy copy, a `Funnels/` twin of `funnels/`, or a dated copy
 (`…-Standard-10-28.md` next to `…-Standard.md`). The copy with frontmatter wins, then a root copy over a legacy one, then
-the lower-case folder, then the shallower one; `set` edits that copy. Two different prompts that share an id but not a
+the lower-case folder, then the shallower one; `set` edits that copy.
+
+**Status folders.** A prompt filed under a `Completed/` sub-folder reads as `done` unless its frontmatter says `done`,
+`skipped` or `superseded` (someone can file a finished prompt by hand). `Pending/` overrides nothing. With
+`status_folders: true`, `set` also `git mv`s the prompt into `<Module>/Completed/` (done, skipped, superseded) or
+`<Module>/Pending/` (every other status), records the move in `_moved.json` and commits old path, new path and the map
+together. `sort` does the same for every prompt at once, leaving a `running` prompt whose session is live where it is
+(its session's stored path stays valid until its own `set`). The Stop gate follows `_moved.json`, so a moved prompt still
+gets its reminder. Tools find a module's folder through `module_folder` (case-folded name or alias; a capitalized
+twin wins), so `Agents/` serves the `agents` module and nothing recreates a lower-case folder. Two different prompts that share an id but not a
 name (`Comms-4-Consent-…` and `Comms-4-Verify-…`) are both kept.
 
 ## Frontmatter
@@ -53,8 +63,12 @@ python3 scripts/command_center.py --json          # for scripts (ops checks)
 python3 scripts/command_center.py --board         # rewrite the status block of every module README + the root board; prints what changed
 python3 scripts/command_center.py --html          # write the HTML dashboard (prompts.html, default ~/.claude/session-tracker/command-center.html)
 python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA] [--deployed TS] [--notes TEXT] [--needs-owner TEXT] [--no-commit]
+python3 scripts/command_center.py sort [--dry-run] [--no-commit]   # file every prompt under Completed/ or Pending/
 python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 ```
+
+`--json` lists `running`, `stalled` and `blocked` prompts with `updated`, `session_id` and `session_live`, so a check can
+age a stalled prompt or spot a blocked one whose session is gone.
 
 `set` updates the frontmatter, regenerates that module's table and the board, and commits those files with a
 pathspec (`docs(prompts): <module> <ID> → <status>`), because an uncommitted edit in a shared tree blocks any later
@@ -82,6 +96,7 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `legacy_globs` | folders still holding prompts not yet moved in (also what `migrate` moves) |
 | `board`, `html` | the root board file; where `--html` writes |
 | `claim_verbs`, `commit_claims`, `gate`, `message` | the claim and gate behaviour above |
+| `status_folders` | `true`: `set` files prompts under `Completed/` / `Pending/` (see Layout) |
 | `module_aliases` | file-name prefix or folder name → module (`Sock → security`, `Organization → org-roles`), case-insensitive |
 | `sync_lock`, `sync_every_hours` | an auto-commit daemon's lock file and cadence; `migrate` refuses to run near it |
 

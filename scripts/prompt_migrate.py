@@ -118,10 +118,10 @@ def plan_moves(spec: dict[str, Any], module: str | None) -> list[Move]:
                 elif pc.INDEX_NAME.match(path.name):
                     token = re.sub(r"-00-README\.md$", "", path.name, flags=re.IGNORECASE)
                     mod, _ = pc.infer_module_and_id(token + "-x.md", None, aliases)
-                    mv = Move(path, root / mod / path.name, mod, "readme")
+                    mv = Move(path, (pc.module_folder(spec, mod) or root / mod) / path.name, mod, "readme")
                 else:
                     mod, _ = pc.infer_module_and_id(path.name, None, aliases)
-                    mv = Move(path, root / mod / path.name, mod, "prompt")
+                    mv = Move(path, (pc.module_folder(spec, mod) or root / mod) / path.name, mod, "prompt")
                 if module and mv.module != module:
                     continue
                 if mv.new.exists() and not mv.new.samefile(path):  # name collision: keep both, date-prefixed
@@ -197,7 +197,8 @@ def apply_moves(spec: dict[str, Any], moves: list[Move]) -> list[str]:
 
 def annotate_module(spec: dict[str, Any], module: str, aliases: dict[str, str]) -> list[str]:
     """Frontmatter for every bare prompt of a module, from its README rows; superseded twins; Paste lines."""
-    repo, folder = Path(str(spec["repo"])), Path(str(spec["repo"])) / str(spec["root"]) / module
+    repo = Path(str(spec["repo"]))
+    folder = pc.module_folder(spec, module) or repo / str(spec["root"]) / module
     if not folder.is_dir():
         return []
     actions = []
@@ -260,7 +261,8 @@ def match_row(rows: list[dict[str, Any]], name: str, ident: str | None, module: 
 
 
 def update_readme(spec: dict[str, Any], module: str, aliases: dict[str, str], today: str) -> list[str]:
-    repo, folder = Path(str(spec["repo"])), Path(str(spec["repo"])) / str(spec["root"]) / module
+    repo = Path(str(spec["repo"]))
+    folder = pc.module_folder(spec, module) or repo / str(spec["root"]) / module
     readme = next((p for p in sorted(folder.iterdir()) if pc.INDEX_NAME.match(p.name) and p.is_file()), None) if folder.is_dir() else None
     if not readme:
         return []

@@ -23,6 +23,8 @@ can override with `SESSION_TRACKER_DIR`. Claude Code's own `~/.claude/sessions/`
 Run `python3 scripts/sessions.py [--all]` or `/sessions` to see the table, newest first:
 - A session that hasn't ended and hasn't been seen for 2 h shows as `stale?`.
 - Ended sessions older than 24 h are hidden unless you pass `--all`.
+- The `prompt` column shows the claimed prompt as `<module>/<ID>` (through `_moved.json` when it was filed
+  under `Completed/` or `Pending/` since), else its file name.
 - Sessions only appear once these hooks run, so a session started in another project is not listed.
 
 ## Stop gates
@@ -36,7 +38,8 @@ and their reasons are joined into one block decision. The board gate blocks when
 - `stop_hook_active` is false.
 
 The prompt gate (`prompts.gate`) blocks when the session claimed a prompt, has commits or deploys, and the prompt's
-frontmatter still says `running` under this session id (docs/command-center.md).
+frontmatter still says `running` under this session id (docs/command-center.md). A prompt moved since the claim is
+found through `_moved.json`.
 
 It also copies `session_log.source` over `session_log.dest` when they differ, keeping `dest`'s leading `<!-- -->`
 header. It never commits.

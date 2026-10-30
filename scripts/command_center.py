@@ -165,8 +165,12 @@ def render_module(view: View, modules: list[dict[str, Any]], show_all: bool) -> 
 def render_json(view: View) -> str:
     mods = view.modules
 
+    live = pc.live_session_ids(view.sessions, view.now)
+
     def brief(p: pc.Prompt) -> dict[str, Any]:
-        return {"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "session_id": p.meta.get("session_id")}
+        sid = p.meta.get("session_id")
+        return {"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "session_id": sid,
+                "session_live": bool(sid) and str(sid) in live, "updated": p.meta.get("updated")}
 
     data = {
         "now": datetime.fromtimestamp(view.now).astimezone().isoformat(timespec="seconds"),
@@ -212,8 +216,8 @@ def _cell(text: str) -> str:
 
 
 def module_readme(view: View, module: str) -> Path | None:
-    folder = Path(str(view.spec["repo"])) / str(view.spec["root"]) / module
-    if not folder.is_dir():
+    folder = pc.module_folder(view.spec, module)
+    if folder is None:
         return None
     for path in sorted(folder.iterdir()):
         if pc.INDEX_NAME.match(path.name) and path.is_file():
@@ -369,6 +373,7 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     try:
         pc.set_status(view.spec, p.rel, args.status, commit=args.commit, deployed=args.deployed, notes=args.notes,
                       needs_owner=args.needs_owner)
+        moved = pc.place(view.spec, p.rel, args.status)[1] if view.spec.get("status_folders") else []
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
         return 2
@@ -377,13 +382,63 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     for n in notes:
         print(n)
     repo = Path(str(view.spec["repo"]))
-    rels = [p.rel] + [str(c.relative_to(repo)) for c in changed]
+    rels = list(dict.fromkeys([p.rel, *moved] + [str(c.relative_to(repo)) for c in changed]))
+    if moved:
+        print(f"moved to {moved[-2]}")
     print(f"{p.module} {p.id or p.name}: {p.status} → {args.status}")
     if args.no_commit:
         print("not committed (--no-commit); files: " + ", ".join(rels))
         return 0
     sha = pc.commit_prompt_files(view.spec, rels, f"docs(prompts): {p.module} {p.id or p.name} → {args.status}")
     print(f"committed {sha[:9]}: " + ", ".join(rels) if sha else "NOT committed (git refused; commit the files yourself): " + ", ".join(rels))
+    return 0
+
+
+def cmd_sort(view: View, args: argparse.Namespace) -> int:
+    """File every prompt under its module's Completed/ or Pending/ folder; a live running prompt stays put."""
+    live = pc.live_session_ids(view.sessions, view.now)
+    repo = Path(str(view.spec["repo"]))
+    paths: list[str] = []
+    count = 0
+    for p in view.prompts:
+        if p.legacy:
+            continue
+        sid = str(p.meta.get("session_id") or "")
+        target = p.path.parent if p.path.parent.name in (pc.COMPLETED_FOLDER, pc.PENDING_FOLDER) else None
+        want = pc.status_folder(p.status)
+        if target is not None and target.name == want:
+            continue
+        if p.status == "running" and sid in live:
+            print(f"skipped {p.name} (running, {sid[:8]})")
+            continue
+        if args.dry_run:
+            parts = Path(p.rel).parts
+            root_parts = Path(str(view.spec["root"])).parts
+            top = Path(*parts[: len(root_parts) + 1])
+            if len(parts) > len(root_parts) + 1:
+                print(f"{p.name} → {top / want / p.name}")
+            continue
+        try:
+            new, touched = pc.place(view.spec, p.rel, p.status)
+        except OSError as e:
+            print(e, file=sys.stderr)
+            continue
+        if touched:
+            print(f"{p.name} → {new}")
+            paths.extend(touched)
+            count += 1
+    if args.dry_run or not paths:
+        print("dry run: nothing moved" if args.dry_run else "nothing to move")
+        return 0
+    changed, notes = regenerate(View(view.cfg, view.now))
+    for n in notes:
+        print(n)
+    rels = list(dict.fromkeys(paths + [str(c.relative_to(repo)) for c in changed]))
+    if args.no_commit:
+        print(f"not committed (--no-commit); {len(rels)} paths")
+        return 0
+    sha = pc.commit_prompt_files(view.spec, rels, f"docs(prompts): sort {count} prompts into Completed/ and Pending/")
+    print(f"committed {sha[:9]}" if sha else "NOT committed (git refused; commit the files yourself)")
     return 0
 
 
@@ -409,6 +464,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--notes")
     s.add_argument("--needs-owner", dest="needs_owner")
     s.add_argument("--no-commit", action="store_true")
+    so = sub.add_parser("sort", help="file every prompt under its module's Completed/ or Pending/ folder")
+    so.add_argument("--dry-run", action="store_true")
+    so.add_argument("--no-commit", action="store_true")
     m = sub.add_parser("migrate", help="move legacy prompt folders into the root, one folder per module")
     m.add_argument("--module")
     m.add_argument("--dry-run", action="store_true")
@@ -430,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
     view = View(cfg, now)
     if args.cmd == "set":
         return cmd_set(view, args)
+    if args.cmd == "sort":
+        return cmd_sort(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))
