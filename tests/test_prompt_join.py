@@ -1,10 +1,8 @@
 import json
-import subprocess
 from datetime import datetime, timedelta
 
 import prompt_center as pc
-from conftest import git
-from test_prompt_scan import cfg, proj  # noqa: F401  (fixture)
+from conftest import cfg, git
 
 NOW = datetime(2026, 10, 30, 16, 0).astimezone()
 

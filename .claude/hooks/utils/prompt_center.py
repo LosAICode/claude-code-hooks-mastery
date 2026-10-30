@@ -91,8 +91,9 @@ def _mtime_ns(path: Path) -> int:
 def write_meta(path: Path, updates: dict[str, Any], expect: dict[str, tuple] | None = None) -> dict[str, Any] | None:
     """Merge ``updates`` into the file's frontmatter; the body is kept byte for byte.
 
-    ``expect`` maps a key to the values it must currently have (``None`` = absent). Returns the new meta,
-    or None when nothing was written (expectation failed, or the file changed underneath).
+    ``expect`` maps a key to the values it must currently have (``None`` = absent). An update whose value is
+    None removes that key. Returns the new meta, or None when nothing was written (expectation failed, or
+    the file changed underneath).
     """
     path = Path(path)
     raw = path.read_bytes()
@@ -102,7 +103,11 @@ def write_meta(path: Path, updates: dict[str, Any], expect: dict[str, tuple] | N
     for key, allowed in (expect or {}).items():
         if meta.get(key) not in allowed:
             return None
-    meta.update(updates)
+    for key, value in updates.items():
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
     out = dump_frontmatter(meta).encode("utf-8") + body
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -491,7 +496,7 @@ def mark_running(spec: dict[str, Any], rel: str, sid: str, live_sids: set[str]) 
 def set_status(spec: dict[str, Any], rel: str, status: str, **fields: Any) -> dict[str, Any]:
     if status not in STATUSES:
         raise ValueError(f"unknown status {status!r}; one of {', '.join(STATUSES)}")
-    updates = {"status": status, "updated": _now_iso()}
+    updates: dict[str, Any] = {"status": status, "updated": _now_iso(), "todo": None}  # setting a status confirms it
     updates.update({k: v for k, v in fields.items() if v is not None})
     spec = _spec(spec)
     path = Path(str(spec["repo"])) / rel

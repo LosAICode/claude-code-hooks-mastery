@@ -266,7 +266,7 @@ def update_readme(spec: dict[str, Any], module: str, aliases: dict[str, str], to
         return []
     text = original = readme.read_text()
     if "<!-- status:begin -->" not in text:
-        block = f"<!-- status:begin -->\n<!-- status:end -->\n\n"
+        block = "<!-- status:begin -->\n<!-- status:end -->\n\n"
         m = _ORDER_HEADING.search(text)
         if m:
             heading = m.group(0)

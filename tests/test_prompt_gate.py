@@ -1,6 +1,5 @@
 """The tracker claims a prompt on the first message and reminds the session once to set its final status."""
 import json
-from datetime import datetime, timedelta
 
 import pytest
 

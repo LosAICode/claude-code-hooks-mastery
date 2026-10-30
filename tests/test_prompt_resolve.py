@@ -3,7 +3,7 @@ import json
 import pytest
 
 import prompt_center as pc
-from test_prompt_scan import cfg, proj  # noqa: F401  (fixture)
+from conftest import cfg
 
 
 def index(proj):

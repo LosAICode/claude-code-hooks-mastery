@@ -1,14 +1,11 @@
 import json
-import os
-from datetime import datetime, timedelta
 
 import pytest
 
 import command_center as cc
 import prompt_center as pc
-from conftest import git
-from test_prompt_join import NOW, iso, session, write_sessions
-from test_prompt_scan import cfg, proj  # noqa: F401  (fixture)
+from conftest import cfg, git
+from test_prompt_join import NOW, session, write_sessions
 
 MARK_BLOCK = "<!-- status:begin -->\nold\n<!-- status:end -->"
 
@@ -59,13 +56,13 @@ def test_terminal_summary(center, capsys):
 def test_terminal_module_rows(center, capsys):
     assert run("--module", "funnels") == 0
     out = capsys.readouterr().out
-    lines = [l for l in out.splitlines() if l.strip()]
+    lines = [line for line in out.splitlines() if line.strip()]
     assert lines[0].startswith("funnels       1/5 done")
-    assert any(l.startswith("order  id      status      ") for l in lines)
-    rows = [l for l in lines if l.startswith(("9c", "9d", "7 ", "5 ", "B4"))]
-    assert any("9c     B12-3   on-main" in l for l in rows)
-    assert any("B4      running     " in l and "d60450f0" in l for l in rows)
-    assert not any("H7" in l for l in lines)
+    assert any(line.startswith("order  id      status      ") for line in lines)
+    rows = [line for line in lines if line.startswith(("9c", "9d", "7 ", "5 ", "B4"))]
+    assert any("9c     B12-3   on-main" in row for row in rows)
+    assert any("B4      running     " in row and "d60450f0" in row for row in rows)
+    assert not any("H7" in line for line in lines)
 
 
 def test_unknown_module_fails(center, capsys):
@@ -146,3 +143,18 @@ def test_set_ambiguous_or_unknown_id(center, capsys):
     assert "ambiguous" in capsys.readouterr().err
     assert run("set", "funnels/B12-4", "done", "--no-commit") == 0
     assert run("set", "Z99", "done", "--no-commit") == 2
+
+
+def test_set_clears_todo_confirm(center):
+    p = center / "docs/Prompts/funnels/Funnels-B8-Sec.md"
+    p.write_text("---\nstatus: pending\norder: 5\ntodo: confirm\n---\n# B8: security sweep\n")
+    assert run("set", "funnels/B8", "deployed", "--no-commit") == 0
+    text = p.read_text()
+    assert "todo" not in text and "status: deployed\n" in text and text.endswith("# B8: security sweep\n")
+
+
+def test_write_meta_none_removes_key(tmp_path):
+    p = tmp_path / "P.md"
+    p.write_text("---\nstatus: pending\ntodo: confirm\n---\n# T\n")
+    assert pc.write_meta(p, {"todo": None}) == {"status": "pending"}
+    assert p.read_text() == "---\nstatus: pending\n---\n# T\n"
