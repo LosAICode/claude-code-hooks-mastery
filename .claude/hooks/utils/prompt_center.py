@@ -482,19 +482,24 @@ def join(prompts: list[Prompt], sessions: list[dict[str, Any]], cfg: dict[str, A
     """{prompt rel: [run, …]} newest first. A session matches by ``prompt_file``, else by its ``task`` text."""
     runs: dict[str, list[dict[str, Any]]] = {}
     by_rel = {p.rel for p in prompts}
+    by_sid = {str(p.meta.get("session_id")): p.rel for p in prompts if p.status == "running" and p.meta.get("session_id")}
+
+    def run_of(s: dict[str, Any], sid: str) -> dict[str, Any]:
+        seen = _parse_iso(s.get("last_seen")) or now
+        return {"sid": sid, "sid8": sid[:8], "state": session_display_state(s, now, stale_after),
+                "age_s": max(0, int(now - seen)), "live": sid in live_session_ids([s], now, stale_after),
+                "branch": s.get("branch"), "worktree": s.get("worktree"), "last_commit": s.get("last_commit")}
+
     for s in sorted(sessions, key=lambda s: _parse_iso(s.get("last_seen")) or 0, reverse=True):
+        sid = str(s["session_id"])
         rel = s.get("prompt_file")
         if not rel or rel not in by_rel:
             rel = resolve_prompt(str(s.get("task") or ""), cfg, prompts)
-        if not rel:
-            continue
-        seen = _parse_iso(s.get("last_seen")) or now
-        sid = str(s["session_id"])
-        runs.setdefault(rel, []).append({
-            "sid": sid, "sid8": sid[:8], "state": session_display_state(s, now, stale_after),
-            "age_s": max(0, int(now - seen)), "live": sid in live_session_ids([s], now, stale_after),
-            "branch": s.get("branch"), "worktree": s.get("worktree"), "last_commit": s.get("last_commit"),
-        })
+        if rel:
+            runs.setdefault(rel, []).append(run_of(s, sid))
+        own = by_sid.get(sid)  # the prompt's frontmatter names this session (claimed later or by hand)
+        if own and own != rel:
+            runs.setdefault(own, []).append(run_of(s, sid))
     return runs
 
 

@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 import os
 
 import pytest
@@ -149,7 +150,9 @@ def test_refuses_dirty_tree_and_live_session(legacy, capsys):
     assert "uncommitted" in err and "Funnels-B12-4" in err
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "edit")
-    write_sessions(tracker, [session("c5588aac-1", task="Run docs/Old-2026-10-28/Funnels-B12-4-Webinar-Honesty.md")])
+    seen_now = datetime.now().astimezone().isoformat(timespec="seconds")  # migrate checks liveness on the wall clock
+    write_sessions(tracker, [session("c5588aac-1", task="Run docs/Old-2026-10-28/Funnels-B12-4-Webinar-Honesty.md",
+                                     last_seen=seen_now)])
     assert pm.main(cfg, "funnels", dry_run=False, force=False) == 1
     assert "c5588aac" in capsys.readouterr().err
     assert pm.main(cfg, "engine", dry_run=False, force=False) == 0          # another module moves fine

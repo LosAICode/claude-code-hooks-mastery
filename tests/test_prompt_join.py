@@ -130,3 +130,16 @@ def test_set_status_rejects_unknown_status(proj):
         assert "finished" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_join_by_the_prompts_own_session_id(proj):
+    """A session works a prompt its first message did not name (set running by hand): the frontmatter id joins them."""
+    h8b = rel(proj, "History-H8b-Paid-Paths-Without-Rows.md")
+    b12 = rel(proj, "Funnels-B12-3-Step-Analytics-CSV.md")
+    pc.write_meta(proj / h8b, {"status": "running", "session_id": "dddd4444-x"})
+    sessions = [session("dddd4444-x", prompt_file=b12)]
+    ps = prompts(proj)
+    runs = pc.join(ps, sessions, cfg(proj), NOW.timestamp())
+    assert [r["sid8"] for r in runs[h8b]] == ["dddd4444"] and [r["sid8"] for r in runs[b12]] == ["dddd4444"]
+    p = next(p for p in ps if p.rel == h8b)
+    assert pc.effective_status(p, runs[h8b]) == "running"
