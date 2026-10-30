@@ -8,11 +8,36 @@
     "repo": "/path/to/project",
     "branch": "main",
     "board": "docs/Status-Board.md",
-    "code_paths": ["src/"],
+    "code_paths": [
+      "src/"
+    ],
     "message": "Update your row in {board} (state, last commit, next) and commit it with a pathspec."
   },
   "session_log": {
     "source": "/path/to/this/repo/reports/STATUS.md",
     "dest": "/path/to/project/docs/Session-Log.md"
+  },
+  "prompts": {
+    "_comment": "Session prompts: one folder per module under root; status in each file's frontmatter. See docs/command-center.md.",
+    "repo": "/path/to/project",
+    "root": "docs/Prompts",
+    "legacy_globs": [
+      "docs/Next-Session-Prompts-*"
+    ],
+    "board": "docs/Prompts/README.md",
+    "html": "~/.claude/session-tracker/command-center.html",
+    "claim_verbs": [
+      "run",
+      "execute",
+      "start"
+    ],
+    "gate": false,
+    "commit_claims": true,
+    "sync_lock": "/tmp/project-git-sync.lock",
+    "sync_every_hours": 0,
+    "module_aliases": {
+      "Sec": "security"
+    },
+    "message": "`{prompt}` is still `running`. Set its final status: `python3 {script} set {ref} done|deployed|on-main|on-branch|blocked --commit <sha> --notes '<one line>'` (it commits the prompt, its module README and the board with a pathspec)."
   }
 }

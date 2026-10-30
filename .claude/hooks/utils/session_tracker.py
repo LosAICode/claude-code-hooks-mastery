@@ -34,6 +34,13 @@ LOG_MAX_BYTES = 1_000_000
 DEFAULT_BLOCK_REASON = (
     "Update your row in {board} (state, last commit, next) and commit it with a pathspec."
 )
+DEFAULT_PROMPT_REASON = (
+    "`{prompt}` is still `running`. Set its final status: `python3 {script} set {ref} "
+    "done|deployed|on-main|on-branch|blocked --commit <sha> --notes '<one line>'` "
+    "(it commits the prompt, its module README and the board with a pathspec)."
+)
+_PROMPT_CENTER_MODULE = "prompt_center"  # sibling module; imported lazily so a bug there never breaks tracking
+DEFAULT_CLAIM_VERBS = ["run", "execute", "start"]
 
 _PROMPT_FILE = re.compile(r"(?:~|\.{0,2}/|\b)[\w.~/-]*/[\w.-]+\.md\b")
 _GIT_SUBCMD = re.compile(
@@ -351,6 +358,10 @@ def apply_event(
     elif event == "UserPromptSubmit":
         if not data.get("task"):
             data["task"] = task_from_prompt(str(payload.get("prompt") or ""))
+            try:
+                _claim_prompt(data, str(payload.get("prompt") or ""), cfg)
+            except Exception as e:
+                log_error("claim_prompt", e)
         _set_state(data, "working")
     elif event in ("PreToolUse", "PermissionRequest"):
         _set_state(data, "waiting_on_owner", tool_summary(str(payload.get("tool_name") or ""), {}))
@@ -368,6 +379,34 @@ def apply_event(
     elif event == "SessionEnd":
         _set_state(data, "ended")
         data["end_reason"] = payload.get("reason")
+
+
+def _claim_prompt(data: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> None:
+    """First message names a prompt file: remember it; if it says to run it, mark the prompt `running`."""
+    spec = cfg.get("prompts")
+    if not isinstance(spec, dict) or not spec.get("repo") or ".md" not in prompt:
+        return
+    import importlib
+
+    pc = importlib.import_module(_PROMPT_CENTER_MODULE)
+    index = pc.scan(cfg)
+    rel = pc.resolve_prompt(prompt, cfg, index)
+    if not rel:
+        return
+    if not pc.claims_prompt(prompt, list(spec.get("claim_verbs") or DEFAULT_CLAIM_VERBS)):
+        data["prompt_mentioned"] = rel
+        return
+    sid = str(data["session_id"])
+    data["prompt_file"] = rel
+    d = tracker_dir()
+    live = pc.live_session_ids(pc.load_sessions(d) if d.is_dir() else [], time.time()) - {sid}
+    prev = pc.mark_running(spec, rel, sid, live)
+    data["prompt_claimed"] = prev is not None
+    data["prompt_prev_status"] = prev
+    if prev is not None and spec.get("commit_claims", True):
+        p = next((p for p in index if p.rel == rel), None)
+        label = f"{p.module} {p.id or p.name}" if p else rel
+        data["prompt_claim_commit"] = pc.commit_prompt_files(spec, [rel], f"docs(prompts): {label} running ({sid[:8]})")
 
 
 def track(event: str, payload: dict[str, Any]) -> None:
@@ -436,6 +475,30 @@ def gate_reason(
     return str(gate.get("message") or DEFAULT_BLOCK_REASON).format(board=board)
 
 
+def prompt_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None, cfg: dict[str, Any]) -> str | None:
+    """Block once when the session claimed a prompt, shipped commits or deploys, and left it `running`."""
+    spec = cfg.get("prompts")
+    if not isinstance(spec, dict) or not spec.get("gate") or not session or payload.get("stop_hook_active"):
+        return None
+    if session.get("prompt_gate_blocked") or not session.get("prompt_claimed") or not session.get("prompt_file"):
+        return None
+    if not session.get("commits") and not session.get("deploys"):
+        return None
+    import importlib
+
+    pc = importlib.import_module(_PROMPT_CENTER_MODULE)
+    rel = str(session["prompt_file"])
+    meta, _, _ = pc.parse_frontmatter(pc._read_head(Path(str(spec["repo"])) / rel))
+    if meta.get("status") != "running" or str(meta.get("session_id") or "") != str(session.get("session_id")):
+        return None
+    script = Path(__file__).resolve().parents[3] / "scripts" / "command_center.py"
+    return str(spec.get("message") or DEFAULT_PROMPT_REASON).format(
+        prompt=rel, ref=os.path.basename(rel).replace(" ", "\\ "), script=script)
+
+
+GATES = (("board_gate", gate_reason), ("prompt_gate", prompt_gate_reason))
+
+
 def sync_session_log(cfg: dict[str, Any]) -> bool:
     """Copy the status log over its private copy when it changed, keeping the copy's leading <!-- --> header.
 
@@ -463,7 +526,11 @@ def sync_session_log(cfg: dict[str, Any]) -> bool:
 
 
 def stop_gate(payload: dict[str, Any]) -> dict[str, str] | None:
-    """Run from the Stop hook. Returns {"decision": "block", "reason": ...} or None. Never raises."""
+    """Run from the Stop hook. Returns {"decision": "block", "reason": ...} or None. Never raises.
+
+    Each gate runs on its own and fires at most once per session (``<gate>_blocked``); their reasons
+    are joined into one block decision.
+    """
     cfg = load_config()
     try:
         sync_session_log(cfg)
@@ -471,15 +538,25 @@ def stop_gate(payload: dict[str, Any]) -> dict[str, str] | None:
         log_error("session_log", e)
     try:
         sid = str(payload.get("session_id") or "")
-        if not sid or not cfg.get("board_gate"):
+        if not sid:
             return None
+        reasons = []
         with _SessionLock(sid):
             session = load_session(sid)
-            reason = gate_reason(payload, session, cfg)
-            if reason and session is not None:
-                session["board_gate_blocked"] = now_iso()
+            if session is None:
+                return None
+            for name, gate in GATES:
+                try:
+                    reason = gate(payload, session, cfg)
+                except Exception as e:
+                    log_error(name, e)
+                    reason = None
+                if reason:
+                    reasons.append(reason)
+                    session[f"{name}_blocked"] = now_iso()
+            if reasons:
                 write_session(session)
-        return {"decision": "block", "reason": reason} if reason else None
+        return {"decision": "block", "reason": "\n".join(reasons)} if reasons else None
     except Exception as e:
         log_error("stop_gate", e)
         return None
