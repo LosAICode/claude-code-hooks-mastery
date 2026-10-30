@@ -235,41 +235,62 @@ def load_prompt(path: Path, rel: str, module: str | None, legacy: bool, aliases:
                   title=str(meta.get("title") or _title(body)), meta=meta, status=status, has_frontmatter=had)
 
 
+_DATE_SUFFIX = re.compile(r"(?:-sent)?\s*-\s*\d{1,2}-\d{2}(?:-\d{2})?$", re.IGNORECASE)
+
+
+def _twin_key(name: str) -> str:
+    """One key for the same prompt saved twice: case folded, a trailing `-10-28` / `-Sent-10-28-26` dropped."""
+    stem = re.sub(r"\.md$", "", name, flags=re.IGNORECASE).strip().lower()
+    return _DATE_SUFFIX.sub("", stem).strip(" -")
+
+
 def scan(cfg: dict[str, Any]) -> list[Prompt]:
-    """Every prompt under the root's module folders plus the legacy globs; one per file name (root wins)."""
+    """Every prompt under the root's module folders (one level of sub-folders too) plus the legacy globs.
+
+    The same prompt saved twice (a legacy copy, a `Funnels/` twin of `funnels/`, a `-10-28` dated copy) counts once:
+    the copy with frontmatter wins, then a root copy over a legacy one, then the lower-case folder, then the shallower.
+    """
     spec = prompts_cfg(cfg)
     if not spec:
         return []
     repo = Path(str(spec["repo"]))
     aliases = dict(spec.get("module_aliases") or {})
-    seen: dict[str, Prompt] = {}
+    seen: dict[str, tuple[tuple, Prompt]] = {}
 
-    def add(path: Path, module: str | None, legacy: bool) -> None:
+    def add(path: Path, module: str | None, legacy: bool, depth: int = 0) -> None:
         if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".md":
             return
         if INDEX_NAME.match(path.name) or path.name.startswith("_"):
             return
-        if path.name in seen and not legacy and seen[path.name].legacy is False:
-            return
-        if path.name in seen and legacy:
-            return
         try:
-            seen[path.name] = load_prompt(path, str(path.relative_to(repo)), module, legacy, aliases)
+            prompt = load_prompt(path, str(path.relative_to(repo)), module, legacy, aliases)
         except OSError:
             return
+        folder = path.parent.name
+        rank = (prompt.has_frontmatter, not legacy, folder == folder.lower(), -depth)
+        key = _twin_key(path.name)
+        if key not in seen or rank > seen[key][0]:
+            seen[key] = (rank, prompt)
+
+    def module_of(folder: Path) -> str:
+        return _alias(folder.name, aliases) or folder.name.lower()
 
     root = repo / str(spec["root"])
     if root.is_dir():
         for folder in sorted(root.iterdir()):
             if folder.is_dir() and not folder.name.startswith("_") and not folder.is_symlink():
                 for path in sorted(folder.iterdir()):
-                    add(path, folder.name, False)
+                    if path.is_dir() and not path.name.startswith("_") and not path.is_symlink():
+                        for sub in sorted(path.iterdir()):
+                            add(sub, module_of(folder), False, depth=1)
+                    else:
+                        add(path, module_of(folder), False)
     for pattern in spec.get("legacy_globs") or []:
         for folder in sorted(repo.glob(str(pattern))):
             if folder.is_dir():
                 for path in sorted(folder.iterdir()):
                     add(path, None, True)
-    return sorted(seen.values(), key=lambda p: (p.module, _order_key(p.order), p.name))
+    return sorted((v[1] for v in seen.values()), key=lambda p: (p.module, _order_key(p.order), p.name))
 
 
 def _order_key(order: str | None) -> tuple:

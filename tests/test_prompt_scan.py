@@ -45,3 +45,43 @@ def test_symlinks_are_skipped(proj):
 
 def test_scan_without_prompts_config_is_empty(proj):
     assert pc.scan({}) == []
+
+
+def test_cased_folder_twin_collapses_onto_the_frontmatter_copy(proj):
+    # the same prompt committed twice: `funnels/<name>.md` (annotated) and `Funnels/<name>-10-28.md` (a bare copy)
+    (proj / "docs/Prompts/funnels/Funnels-B6-Builder-UX-Standard.md").write_text("---\nstatus: deployed\n---\n# B6\n")
+    cased = proj / "docs/Prompts/Funnels"
+    cased.mkdir()
+    (cased / "Funnels-B6-Builder-UX-Standard-10-28.md").write_text("# B6\n")
+    (cased / "Funnels-B4-Publish-Wiring-Guarantee-Sent - 10-28.md").write_text("# B4 publish wiring\n")
+    got = [p for p in pc.scan(cfg(proj)) if p.id in ("B6", "B4")]
+    assert sorted((p.module, p.id, p.status) for p in got) == [("funnels", "B4", "pending"), ("funnels", "B6", "deployed")]
+    assert all(p.rel.startswith("docs/Prompts/funnels/") for p in got)
+
+
+def test_folder_module_is_case_insensitive_and_aliased(proj):
+    (proj / "docs/Prompts/Organization").mkdir()
+    (proj / "docs/Prompts/Organization/08-Org-Roles-P1-Leftovers.md").write_text("# P1\n")
+    (proj / "docs/Prompts/Agents").mkdir()
+    (proj / "docs/Prompts/Agents/Agents-A03-Org-Scope.md").write_text("# A03\n")
+    c = cfg(proj)
+    c["prompts"]["module_aliases"]["Organization"] = "org-roles"
+    got = {p.path.name: p.module for p in pc.scan(c)}
+    assert got["08-Org-Roles-P1-Leftovers.md"] == "org-roles" and got["Agents-A03-Org-Scope.md"] == "agents"
+
+
+def test_subfolder_prompts_belong_to_the_module(proj):
+    done = proj / "docs/Prompts/funnels/Completed"
+    done.mkdir()
+    (done / "Funnels-B1-Old.md").write_text("# B1\n")
+    (proj / "docs/Prompts/funnels/_drafts").mkdir()
+    (proj / "docs/Prompts/funnels/_drafts/Funnels-B99-Draft.md").write_text("# B99\n")
+    got = {p.path.name: p.module for p in pc.scan(cfg(proj))}
+    assert got["Funnels-B1-Old.md"] == "funnels" and "Funnels-B99-Draft.md" not in got
+
+
+def test_distinct_prompts_sharing_an_id_are_both_kept(proj):
+    for name in ("Comms-4-Consent-Followups-10-28.md", "Comms-4-Verify-Header-Fix-10-28.md"):
+        (proj / "docs/Prompts/funnels" / name).write_text("# comms 4\n")
+    names = by_name(pc.scan(cfg(proj)))
+    assert "Comms-4-Consent-Followups-10-28.md" in names and "Comms-4-Verify-Header-Fix-10-28.md" in names

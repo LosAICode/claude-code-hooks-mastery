@@ -15,9 +15,16 @@ which wait on the owner. The data is the prompt files themselves plus the sessio
   _batches/<date>-00-README.md         cross-module batch indexes moved in by `migrate`
 ```
 
-Module = the folder. For a prompt in a legacy folder (`legacy_globs`), the module comes from the file-name prefix through
-`module_aliases` (`Sock → security`, `F3 → engine`, …) and the id from the next token (`Funnels-B12-3-…` → `B12-3`,
-`01-Sock-…` → `01`). A file name is never changed by the tools, so links and `find -name` keep working.
+Module = the folder, case-folded and passed through `module_aliases` (`Organization/` → `org-roles`), including one level
+of sub-folders (`funnels/Completed/B1.md` is still a funnels prompt). For a prompt in a legacy folder (`legacy_globs`),
+the module comes from the file-name prefix through `module_aliases` (`Sock → security`, `F3 → engine`, …) and the id from
+the next token (`Funnels-B12-3-…` → `B12-3`, `01-Sock-…` → `01`). A file name is never changed by the tools, so links and
+`find -name` keep working.
+
+The same prompt saved twice counts once: a legacy copy, a `Funnels/` twin of `funnels/`, or a dated copy
+(`…-Standard-10-28.md` next to `…-Standard.md`). The copy with frontmatter wins, then a root copy over a legacy one, then
+the lower-case folder, then the shallower one; `set` edits that copy. Two different prompts that share an id but not a
+name (`Comms-4-Consent-…` and `Comms-4-Verify-…`) are both kept.
 
 ## Frontmatter
 
@@ -75,7 +82,7 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `legacy_globs` | folders still holding prompts not yet moved in (also what `migrate` moves) |
 | `board`, `html` | the root board file; where `--html` writes |
 | `claim_verbs`, `commit_claims`, `gate`, `message` | the claim and gate behaviour above |
-| `module_aliases` | file-name prefix → module, for legacy names |
+| `module_aliases` | file-name prefix or folder name → module (`Sock → security`, `Organization → org-roles`), case-insensitive |
 | `sync_lock`, `sync_every_hours` | an auto-commit daemon's lock file and cadence; `migrate` refuses to run near it |
 
 ## Migration
