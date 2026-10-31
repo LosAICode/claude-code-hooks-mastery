@@ -601,6 +601,12 @@ def status_board_clean(view: View) -> bool:
         return False
 
 
+def fill_markers(view: View, text: str) -> str:
+    mods = {m["module"]: m for m in view.modules}
+    return PROMPTS_MARK.sub(lambda mt: mt.group(1) + prompts_line(mods[mt.group("mod")]) + mt.group(4)
+                            if mt.group("mod") in mods else mt.group(0), text)
+
+
 def refresh_status_board(view: View) -> tuple[Path | None, str | None]:
     """Rewrite the text between each ``<!-- prompts:<module> -->`` / ``<!-- /prompts -->`` pair; nothing else."""
     rel = view.spec.get("status_board")
@@ -610,9 +616,7 @@ def refresh_status_board(view: View) -> tuple[Path | None, str | None]:
     text = path.read_text()
     if not PROMPTS_MARK.search(text):
         return None, None
-    mods = {m["module"]: m for m in view.modules}
-    new = PROMPTS_MARK.sub(lambda mt: mt.group(1) + prompts_line(mods[mt.group("mod")]) + mt.group(4)
-                           if mt.group("mod") in mods else mt.group(0), text)
+    new = fill_markers(view, text)
     if new == text:
         return None, None
     if not status_board_clean(view):
@@ -645,8 +649,8 @@ def cmd_board_markers(view: View, args: argparse.Namespace) -> int:
             lines[i] = line[:at] + f" <!-- prompts:{module} --><!-- /prompts -->" + line[at:]
             have.add(module)
             added.append(module)
-    if added:
-        write_if_changed(path, "\n".join(lines))
+    if added:  # filled here: once written, the board is dirty and the refresh in commit_change would skip it
+        write_if_changed(path, fill_markers(view, "\n".join(lines)))
     print("markers added: " + (", ".join(added) if added else "none (every module row has one)"))
     commit_change(view, [], [str(rel)], f"docs(status-board): generated Prompts: line per module row ({', '.join(added) or 'refresh'})",
                   args.no_commit or not added)

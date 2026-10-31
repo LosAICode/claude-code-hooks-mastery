@@ -336,3 +336,14 @@ def test_a_status_board_with_someone_elses_edits_is_left_alone(center, capsys, t
     out = capsys.readouterr().out
     assert board.read_text() == before and "uncommitted edits" in out
     assert run("board-markers", "--no-commit") == 2
+
+
+def test_board_markers_in_a_git_repo_fill_and_commit_in_one_go(center, capsys, tmp_path):
+    board = _with_status_board(center, tmp_path)
+    git(center, "init", "-q", "-b", "main")
+    git(center, "add", "-A")
+    git(center, "commit", "-q", "-m", "init")
+    assert run("board-markers") == 0
+    assert "<!-- prompts:funnels -->**Prompts:** 🟢 1/5" in board.read_text()
+    assert git(center, "status", "--porcelain", "--", "docs/Status-Board.md") == ""
+    assert git(center, "log", "-1", "--format=%s").startswith("docs(status-board): generated Prompts: line")
