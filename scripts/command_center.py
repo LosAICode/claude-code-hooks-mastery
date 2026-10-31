@@ -10,7 +10,8 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py --board             # regenerate the module README tables + the root board
     python3 scripts/command_center.py --html              # write the HTML dashboard, print its path
     python3 scripts/command_center.py set <id|module/id|file> <status> [--commit SHA] [--deployed TS]
-                                          [--notes TEXT] [--needs-owner TEXT] [--no-commit]
+                                          [--notes TEXT] [--needs-owner TEXT] [--comment] [--close] [--no-commit]
+    python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]  # prompts × GitHub issues
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
@@ -24,6 +25,7 @@ import argparse
 import html
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -32,12 +34,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "hooks" / "utils"))
 import prompt_center as pc  # noqa: E402
+import prompt_issues as pi  # noqa: E402
 from session_tracker import attach_prompt, load_config, tracker_dir  # noqa: E402
 
 BEGIN, END = "<!-- status:begin -->", "<!-- status:end -->"
 COLUMNS = [("order", 5), ("id", 6), ("status", 10), ("needs owner", 18), ("session", 16), ("commit", 10),
-           ("updated", 10), ("title", 40)]
-TABLE_HEADER = "| # | Prompt | Status | Owner | Commit | Updated | Notes |\n|---|---|---|---|---|---|---|\n"
+           ("issue", 9), ("updated", 10), ("title", 40)]
+TABLE_HEADER = "| # | Prompt | Status | Owner | Commit | Issue | Updated | Notes |\n|---|---|---|---|---|---|---|---|\n"
 BOARD_HEADER = "| Module | Done | Progress | Running | Pending | Blocked |\n|---|---|---|---|---|---|\n"
 
 
@@ -158,7 +161,8 @@ def render_module(view: View, modules: list[dict[str, Any]], show_all: bool) -> 
             if status in pc.NOT_COUNTED and not show_all:
                 continue
             cells = [p.order or "", p.id or "", status, meta_str(p, "needs_owner"), run_cell(view.runs_of(p)),
-                     meta_str(p, "commit"), meta_str(p, "updated")[:10], p.title or p.name]
+                     meta_str(p, "commit"), ", ".join(str(n) for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10],
+                     p.title or p.name]
             out.append("  ".join(fit(c, w).ljust(w) for c, (_, w) in zip(cells, COLUMNS)).rstrip())
         out.append("")
     return "\n".join(out).rstrip() + "\n"
@@ -208,7 +212,7 @@ def render_module_table(view: View, m: dict[str, Any]) -> str:
             st += f" ({who})" if who else ""
         commit = meta_str(p, "commit")
         cells = [p.order or "", f"`{p.name}`", st, meta_str(p, "needs_owner"), f"`{commit}`" if commit else "",
-                 meta_str(p, "updated")[:10], _cell(meta_str(p, "notes") + (" · todo: confirm" if p.meta.get("todo") else ""))]
+                 ", ".join(f"#{n}" for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10], _cell(meta_str(p, "notes") + (" · todo: confirm" if p.meta.get("todo") else ""))]
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join(rows) + "\n"
 
@@ -373,6 +377,9 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     except LookupError as e:
         print(e, file=sys.stderr)
         return 2
+    if args.close and args.status not in pc.CLOSED:
+        print(f"--close closes the issue of a finished prompt ({', '.join(pc.CLOSED)}), not {args.status}", file=sys.stderr)
+        return 2
     try:
         pc.set_status(view.spec, p.rel, args.status, commit=args.commit, deployed=args.deployed, notes=args.notes,
                       needs_owner=args.needs_owner)
@@ -385,7 +392,64 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     print(f"{p.module} {p.id or p.name}: {p.status} → {args.status}")
     commit_change(view, [p.module], [p.rel, *moved], f"docs(prompts): {p.module} {p.id or p.name} → {args.status}",
                   args.no_commit)
+    if args.comment or args.close:
+        return post_progress(view, p, args)
     return 0
+
+
+def post_progress(view: View, p: pc.Prompt, args: argparse.Namespace) -> int:
+    """One comment on the prompt's (first) issue: the status change, commit, deploy time and notes; --close closes it."""
+    numbers = pi.issues_of(p.meta)
+    if not numbers:
+        print(f"{pi.label(p)} has no issue in its frontmatter; nothing posted (`issues` lists its candidates)")
+        return 0
+    body = " · ".join([f"{pi.label(p)}: {p.status} → {args.status}"] + [x for x in (
+        f"commit `{args.commit}`" if args.commit else "", f"deployed {args.deployed}" if args.deployed else "",
+        args.notes or "") if x])
+    verb = ("close", "--comment") if args.close else ("comment", "--body")
+    try:
+        pi.gh(str(view.spec["repo"]), "issue", verb[0], str(numbers[0]), verb[1], body)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"NOT posted to #{numbers[0]} ({type(e).__name__}); post it yourself: {body}", file=sys.stderr)
+        return 1
+    print(f"#{numbers[0]}: " + ("closed with" if args.close else "commented") + f" \"{body}\"")
+    return 0
+
+
+def cmd_issues(view: View, args: argparse.Namespace) -> int:
+    """Prompts × GitHub issues: missing, unlinked, duplicates, state mismatches. --fix writes the keys it can match."""
+    try:
+        issues = pi.fetch_issues(str(view.spec["repo"]))
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        print(f"gh issue list failed ({type(e).__name__}); is gh logged in for this repo?", file=sys.stderr)
+        return 2
+    prompts = [p for p in view.prompts if not args.module or p.module == args.module]
+    found = pi.audit(prompts, issues, view.cfg)
+    print(render_issues_header(view, prompts, issues))
+    print(pi.render(found))
+    if not args.fix:
+        return 0
+    fixable = [(p, hits[0]) for p, hits in found["missing"] if len(hits) == 1]
+    if not fixable:
+        print("\n--fix: nothing to write (a prompt needs exactly one issue naming it)")
+        return 0
+    for p, issue in fixable:
+        pc.write_meta(p.path, {"issue": str(issue["number"])})
+        print(f"{pi.label(p)}: issue #{issue['number']}")
+    labels: dict[str, list[str]] = {}
+    for p, _ in fixable:
+        labels.setdefault(p.module, []).append(p.id or p.name)
+    what = "; ".join(f"{m} {', '.join(ids)}" for m, ids in labels.items())
+    commit_change(view, list(labels), [p.rel for p, _ in fixable],
+                  f"docs(prompts): issues --fix: {len(fixable)} issue keys ({what})", args.no_commit)
+    return 0
+
+
+def render_issues_header(view: View, prompts: list[pc.Prompt], issues: list[dict[str, Any]]) -> str:
+    linked = sum(1 for p in prompts if pi.issues_of(p.meta))
+    needing = sum(1 for p in prompts if pi.issues_of(p.meta) or p.status not in pc.NOT_COUNTED)
+    return (f"Issues · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {linked}/{needing} prompts "
+            f"have an issue (skipped/superseded need none) · {len(issues)} issues on GitHub")
 
 
 def commit_change(view: View, modules: list[str], rels: list[str], message: str, no_commit: bool) -> str | None:
@@ -599,6 +663,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--notes")
     s.add_argument("--needs-owner", dest="needs_owner")
     s.add_argument("--no-commit", action="store_true")
+    s.add_argument("--comment", action="store_true", help="post one progress comment (status + commit) to its issue")
+    s.add_argument("--close", action="store_true", help="close its issue with that comment (done/skipped/superseded)")
+    i = sub.add_parser("issues", help="prompts × GitHub issues: missing, unlinked, duplicates, state mismatches")
+    i.add_argument("--module")
+    i.add_argument("--fix", action="store_true", help="write the issue: keys it can match (never creates an issue)")
+    i.add_argument("--no-commit", action="store_true")
     c = sub.add_parser("claim", help="attach a live session to a prompt (running + session_id; arms its Stop gate)")
     c.add_argument("ref", help="ID, module/ID or file name")
     c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
@@ -638,6 +708,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_claim(view, args)
     if args.cmd == "deploy-check":
         return cmd_deploy_check(view, args)
+    if args.cmd == "issues":
+        return cmd_issues(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))

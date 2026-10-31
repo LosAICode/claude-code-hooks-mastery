@@ -19,7 +19,7 @@ from typing import Any
 
 KNOWN_KEYS = (
     "module", "id", "order", "title", "status", "needs_owner", "cost", "depends_on",
-    "session_id", "commit", "deployed", "updated", "notes", "todo",
+    "session_id", "commit", "deployed", "updated", "notes", "todo", "issue",
 )
 MAX_FRONTMATTER_LINES = 60
 _NEEDS_QUOTE = re.compile(r"""^[\[{"'!&*>|%@#`]|: | #|^$|^\s|\s$""")

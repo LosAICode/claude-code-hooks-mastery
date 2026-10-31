@@ -89,7 +89,7 @@ def test_board_regenerates_readme_and_board_only_when_changed(center, capsys):
     out = capsys.readouterr().out
     readme = (center / "docs/Prompts/funnels/Funnels-00-README.md").read_text()
     assert "intro\n" in readme and "## Order (frozen)\n| a |\n" in readme
-    assert "| # | Prompt | Status | Owner | Commit | Updated | Notes |" in readme
+    assert "| # | Prompt | Status | Owner | Commit | Issue | Updated | Notes |" in readme
     assert "| 9c | `Funnels-B12-3-Step-Analytics-CSV.md` | 🔵 on-main |" in readme
     assert "| 7 | `Funnels-B11-Perf.md` | 🟡 deployed |  | `c4201b3d3` |" in readme
     assert "▶ running (d60450f0)" in readme
@@ -184,3 +184,13 @@ def test_claim_takes_over_a_stalled_prompt(center):
     assert run("claim", "history/H7", "--session", "c5588aac-2222", "--no-commit") == 0
     m = pc.parse_frontmatter((center / "docs/Prompts/history/History-H7-Polish.md").read_text())[0]
     assert m["status"] == "running" and m["session_id"] == "c5588aac-2222"
+
+
+def test_module_table_has_an_issue_column(center):
+    p = center / "docs/Prompts/funnels/Funnels-B12-4-Webinar.md"
+    p.write_text("---\nstatus: pending\norder: 9d\nissue: \"612\"\n---\n# B12-4: webinar honesty\n")
+    view = cc.View(pc.prompts_cfg and __import__("session_tracker").load_config(), NOW.timestamp())
+    m = next(m for m in view.modules if m["module"] == "funnels")
+    table = cc.render_module_table(view, m)
+    assert table.startswith("| # | Prompt | Status | Owner | Commit | Issue | Updated | Notes |")
+    assert "| 9d | `Funnels-B12-4-Webinar.md` | ⚪ pending |  |  | #612 |" in table
