@@ -12,6 +12,7 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py set <id|module/id|file> <status> [--commit SHA] [--deployed TS]
                                           [--notes TEXT] [--needs-owner TEXT] [--no-commit]
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
+    python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 
 Config: the ``prompts`` block of the session tracker config (see docs/command-center.md).
@@ -478,6 +479,104 @@ def cmd_sort(view: View, args: argparse.Namespace) -> int:
     return 0
 
 
+# --- deploy-check ---------------------------------------------------------------------------------------
+
+DEPLOY_SECTIONS = (("live", "Live in every unit it needs"), ("half", "Half live"),
+                   ("waiting", "Waiting (no needed unit restarted since it landed)"),
+                   ("no-unit", "No unit needed (docs, tests, scripts)"), ("unchecked", "Not checked"))
+
+
+def _hm(epoch: float | None) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%m-%d %H:%M") if epoch else "?"
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
+
+
+def render_deploy(results: list[dict[str, Any]], umap: dict[str, Any], now: float) -> str:
+    import prompt_deploy as pd
+
+    starts = {u: s for e in results for u, s in e["starts"].items()}
+    units = " · ".join(f"{u} {_hm(s) if s else 'not running'}" for u, s in
+                       sorted(starts.items(), key=lambda us: (umap["order"].index(us[0]) if us[0] in umap["order"] else 99)))
+    lines = [f"Deploy check · {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M')} · {len(results)} on-main/deployed prompts",
+             f"unit starts: {units or '(none needed)'}"]
+    for state, title in DEPLOY_SECTIONS:
+        rows = [e for e in results if e["state"] == state]
+        if not rows:
+            continue
+        lines += ["", f"{title} ({len(rows)})"]
+        for e in rows:
+            label = f"{e['module']} {e['id'] or e['name'].removesuffix('.md')}"
+            head = f"  {fit(label, 27):<28}{e['status']:<10}"
+            if state == "unchecked":
+                lines.append(head + str(e["reason"]))
+                continue
+            shas = ", ".join(c["sha"] for c in e["commits"])
+            tail = [f"{shas} landed {_hm(e['landed'])}"]
+            if state == "live":
+                tail.append(f"live since {_hm(e['live_since'])}" + (f" ({', '.join(pd.compact(e['needs'], umap))})"
+                                                                    if e["needs"] else " (at merge)"))
+            elif state in ("half", "waiting"):
+                if e["live"]:
+                    tail.append("live: " + ", ".join(pd.compact(e["live"], umap)))
+                groups = umap.get("groups") or {}
+
+                def started(unit: str) -> str:
+                    times = [e["starts"].get(u) for u in groups.get(unit, [unit])]
+                    return f"started {_hm(min(times))}" if all(times) else "not running"
+
+                tail.append("waits: " + ", ".join(f"{u} ({started(u)})" for u in pd.compact(e["waits"], umap)))
+            if state == "live" and e["status"] == "on-main":
+                tail.append("→ deployed with --apply")
+            if e.get("reason"):
+                tail.append(f"skipped {e['reason']}")
+            lines.append(head + " · ".join(tail))
+    return "\n".join(lines)
+
+
+def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
+    import prompt_deploy as pd
+
+    try:
+        umap = pd.load_map(view.spec)
+    except (OSError, ValueError) as e:
+        print(f"unit map unreadable: {e}", file=sys.stderr)
+        return 2
+    if umap is None:
+        print("no unit map: set prompts.unit_map in the tracker config (see docs/command-center.md)", file=sys.stderr)
+        return 2
+    prompts = [p for p in view.prompts if not args.module or p.module == args.module]
+    history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+    results = pd.check(prompts, view.spec, umap, history)
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), "units": {u: s for e in results for u, s in e["starts"].items()},
+                          "prompts": results}, indent=1))
+        return 0
+    print(render_deploy(results, umap, view.now))
+    if not args.apply:
+        return 0
+    ready = [e for e in results if e["state"] == "live" and e["status"] == "on-main"]
+    if not ready:
+        print("\n--apply: nothing to set (only an on-main prompt live in every unit it needs moves to deployed)")
+        return 0
+    by_rel = {p.rel: p for p in view.prompts}
+    rels: list[str] = []
+    for e in ready:
+        p = by_rel[e["rel"]]
+        pc.set_status(view.spec, p.rel, "deployed", deployed=_iso(e["live_since"]))
+        rels += [p.rel, *(pc.place(view.spec, p.rel, "deployed")[1] if view.spec.get("status_folders") else [])]
+        print(f"{p.module} {p.id or p.name}: on-main → deployed ({_hm(e['live_since'])})")
+    labels: dict[str, list[str]] = {}
+    for e in ready:
+        labels.setdefault(e["module"], []).append(e["id"] or e["name"])
+    what = "; ".join(f"{m} {', '.join(ids)}" for m, ids in labels.items())
+    commit_change(view, list(labels), rels, f"docs(prompts): deploy-check: {len(ready)} prompts deployed ({what})",
+                  args.no_commit)
+    return 0
+
+
 # --- main ------------------------------------------------------------------------------------------------
 
 
@@ -504,6 +603,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     c.add_argument("ref", help="ID, module/ID or file name")
     c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
     c.add_argument("--no-commit", action="store_true")
+    d = sub.add_parser("deploy-check", help="the units each on-main/deployed prompt needs, and which restarted since it landed")
+    d.add_argument("--module")
+    d.add_argument("--json", action="store_true")
+    d.add_argument("--apply", action="store_true", help="set deployed where every needed unit restarted after landing")
+    d.add_argument("--no-commit", action="store_true")
     so = sub.add_parser("sort", help="file every prompt under its module's Completed/ or Pending/ folder")
     so.add_argument("--dry-run", action="store_true")
     so.add_argument("--no-commit", action="store_true")
@@ -532,6 +636,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_sort(view, args)
     if args.cmd == "claim":
         return cmd_claim(view, args)
+    if args.cmd == "deploy-check":
+        return cmd_deploy_check(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))

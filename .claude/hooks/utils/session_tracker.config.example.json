@@ -33,6 +33,8 @@
     ],
     "gate": false,
     "commit_claims": true,
+    "unit_map": "scripts/deploy_units.json",
+    "main_branch": "main",
     "sync_lock": "/tmp/project-git-sync.lock",
     "sync_every_hours": 0,
     "module_aliases": {
