@@ -287,3 +287,52 @@ def test_next_up_ranks_prompts_needing_no_owner_first(center, capsys):
     b12, h9 = (next(i for i, line in enumerate(nxt) if ident in line) for ident in ("B12-4", "H9"))
     assert b12 < h9 and h9 == len(nxt) - 1  # the one that needs the owner comes last
     assert "⚑ needs owner: cost OK" in nxt[h9] and "needs owner" not in nxt[b12]
+
+
+def _with_status_board(center, tmp_path):
+    (center / "docs/Status-Board.md").write_text(STATUS_BOARD)
+    c = json.loads((tmp_path / "config.json").read_text())
+    c["prompts"]["status_board"] = "docs/Status-Board.md"
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    return center / "docs/Status-Board.md"
+
+
+def test_board_markers_go_in_once_per_module_and_set_refreshes_them(center, capsys, tmp_path):
+    board = _with_status_board(center, tmp_path)
+    assert run("board-markers", "--no-commit") == 0
+    lines = board.read_text().splitlines()
+    funnels = next(line for line in lines if line.startswith("| Funnels backlog"))
+    assert funnels.startswith("| Funnels backlog B1-B12 | <!-- prompts:funnels -->**Prompts:** ")
+    assert funnels.endswith("<!-- /prompts --> 🟢 B4-B9 live; 🔵 **B11 ON MAIN, deploy HELD** · B12-4 merged, held | `abc` | B13 | x |")
+    assert "🔴 blocked B8" in funnels and "⚪ 1 pending (next B12-4)" in funnels
+    assert "<!-- prompts:history -->" in next(line for line in lines if line.startswith("| History"))
+    assert "prompts:" not in next(line for line in lines if line.startswith("| Magnus"))
+    once = board.read_text()
+    assert run("board-markers", "--no-commit") == 0 and board.read_text() == once  # idempotent
+    assert run("set", "funnels/B12-4", "on-main", "--commit", "abc1234", "--no-commit") == 0
+    assert "🔵 on-main B12-3, B12-4" in board.read_text()
+
+
+def test_board_check_ignores_the_generated_lines(center, capsys, tmp_path):
+    board = _with_status_board(center, tmp_path)
+    assert run("board-markers", "--no-commit") == 0
+    # a stale generated line (refresh skipped while the board was dirty) is not a hand-written claim
+    board.write_text(board.read_text() + "| Funnels later | <!-- prompts:funnels -->🔵 on-main B12-3 · 🔵 B11 ON MAIN<!-- /prompts --> | x | x | x |\n")
+    capsys.readouterr()
+    run("board-check")
+    out = capsys.readouterr().out
+    assert out.count("funnels B11") == 1 and "Prompts:" not in out
+
+
+def test_a_status_board_with_someone_elses_edits_is_left_alone(center, capsys, tmp_path):
+    board = _with_status_board(center, tmp_path)
+    assert run("board-markers", "--no-commit") == 0
+    git(center, "init", "-q", "-b", "main")
+    git(center, "add", "-A")
+    git(center, "commit", "-q", "-m", "init")
+    board.write_text(board.read_text() + "\nanother session's line\n")
+    before = board.read_text()
+    assert run("set", "funnels/B12-4", "on-main", "--no-commit") == 0
+    out = capsys.readouterr().out
+    assert board.read_text() == before and "uncommitted edits" in out
+    assert run("board-markers", "--no-commit") == 2

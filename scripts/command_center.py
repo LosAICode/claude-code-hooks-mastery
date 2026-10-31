@@ -14,6 +14,7 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]  # prompts × GitHub issues
     python3 scripts/command_center.py audit [--module M]       # exit 1 when it finds something
     python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts (read-only)
+    python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line per module row
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
@@ -308,6 +309,9 @@ def regenerate(view: View, modules: list[str] | None = None) -> tuple[list[Path]
                 changed.append(path)
         else:
             notes.append(f"{board}: missing (create it with the markers to get the board)")
+    sb, note = refresh_status_board(view)
+    changed += [sb] if sb else []
+    notes += [note] if note else []
     return changed, notes
 
 
@@ -555,6 +559,100 @@ _LIVE = re.compile(r"\bdeployed\b|\blive\b(?!\s+(?:proof|walk|check|probe|data|c
 NOT_LIVE = ("pending", "running", "on-branch", "on-main", "blocked")
 
 
+PROMPTS_MARK = re.compile(r"(<!-- prompts:(?P<mod>[\w-]+) -->)(.*?)(<!-- /prompts -->)")
+
+
+def row_module(name: str, modules: set[str], aliases: dict[str, str]) -> str | None:
+    """The first module a Status Board row's first cell names (``Funnels backlog B1-B12`` → funnels)."""
+    for w in re.findall(r"[A-Za-z][\w-]*", name):
+        m = pc._alias(w, aliases) or w.lower()
+        if m in modules:
+            return m
+    return None
+
+
+def prompts_line(m: dict[str, Any]) -> str:
+    """The generated one-line summary a Status Board row carries between its prompts markers (no time stamp:
+    it changes only when a status does)."""
+    by: dict[str, list[pc.Prompt]] = {}
+    for p, s in sorted(m["prompts"], key=lambda ps: (pc._order_key(ps[0].order), ps[0].name)):
+        by.setdefault(s, []).append(p)
+    c = m["counts"]
+    parts = [f"🟢 {m['finished']}/{m['total']} done or deployed ({c.get('done', 0)} done, {c.get('deployed', 0)} deployed)"]
+    for status in ("running", "stalled", "on-branch", "on-main", "blocked"):
+        if by.get(status):
+            parts.append(f"{pc.MARKS[status]} {status} " + ", ".join(p.id or p.name for p in by[status]))
+    if by.get("pending"):
+        parts.append(f"⚪ {len(by['pending'])} pending" + (f" (next {m['next'].id})" if m["next"] and m["next"].id else ""))
+    return "**Prompts:** " + " · ".join(parts) + "."
+
+
+def status_board_clean(view: View) -> bool:
+    """False when the hand-written board has uncommitted edits (another session's lines we must not commit)."""
+    import subprocess as sp
+
+    repo = str(view.spec["repo"])
+    try:
+        if sp.run(["git", "-C", repo, "rev-parse", "--git-dir"], capture_output=True, timeout=20).returncode != 0:
+            return True  # not a git repo: no one else's commit to protect (and `git diff` would compare without an index)
+        return sp.run(["git", "-C", repo, "diff", "--quiet", "HEAD", "--", str(view.spec["status_board"])],
+                      capture_output=True, timeout=20).returncode == 0
+    except (OSError, sp.SubprocessError):
+        return False
+
+
+def refresh_status_board(view: View) -> tuple[Path | None, str | None]:
+    """Rewrite the text between each ``<!-- prompts:<module> -->`` / ``<!-- /prompts -->`` pair; nothing else."""
+    rel = view.spec.get("status_board")
+    path = Path(str(view.spec["repo"])) / str(rel or "")
+    if not rel or not path.is_file():
+        return None, None
+    text = path.read_text()
+    if not PROMPTS_MARK.search(text):
+        return None, None
+    mods = {m["module"]: m for m in view.modules}
+    new = PROMPTS_MARK.sub(lambda mt: mt.group(1) + prompts_line(mods[mt.group("mod")]) + mt.group(4)
+                           if mt.group("mod") in mods else mt.group(0), text)
+    if new == text:
+        return None, None
+    if not status_board_clean(view):
+        return None, f"{rel}: has uncommitted edits (another session's?); its Prompts: lines not refreshed"
+    write_if_changed(path, new)
+    return path, None
+
+
+def cmd_board_markers(view: View, args: argparse.Namespace) -> int:
+    """Put a prompts marker at the start of the State cell of the first row per module that lacks one."""
+    rel = view.spec.get("status_board")
+    if not rel:
+        print("no status board: set prompts.status_board in the tracker config", file=sys.stderr)
+        return 2
+    if not status_board_clean(view):
+        print(f"{rel} has uncommitted edits (another session's?); commit or wait, then rerun", file=sys.stderr)
+        return 2
+    path = Path(str(view.spec["repo"])) / str(rel)
+    lines = path.read_text().split("\n")
+    modules = {m["module"] for m in view.modules}
+    have = {mt.group("mod") for mt in PROMPTS_MARK.finditer("\n".join(lines))}
+    added = []
+    for i, line in enumerate(lines):
+        cells = line.strip().strip("|").split("|")
+        if not line.startswith("|") or len(cells) < 2:
+            continue
+        module = row_module(cells[0].strip(), modules, dict(view.spec.get("module_aliases") or {}))
+        if module and module not in have and cells[0].strip() not in ("Workstream", "Module"):
+            at = line.index("|", 1) + 1
+            lines[i] = line[:at] + f" <!-- prompts:{module} --><!-- /prompts -->" + line[at:]
+            have.add(module)
+            added.append(module)
+    if added:
+        write_if_changed(path, "\n".join(lines))
+    print("markers added: " + (", ".join(added) if added else "none (every module row has one)"))
+    commit_change(view, [], [str(rel)], f"docs(status-board): generated Prompts: line per module row ({', '.join(added) or 'refresh'})",
+                  args.no_commit or not added)
+    return 0
+
+
 def board_rows(text: str) -> list[tuple[str, str]]:
     """[(first cell, the State cell)] of every Markdown table row but headers and separators.
 
@@ -565,7 +663,7 @@ def board_rows(text: str) -> list[tuple[str, str]]:
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if line.startswith("|") and len(cells) >= 2 and cells[0] and not set(cells[0]) <= set("-:") \
                 and cells[0] not in ("Workstream", "Module"):
-            rows.append((cells[0], re.sub(r"`[^`]*`", "", cells[1])))
+            rows.append((cells[0], re.sub(r"`[^`]*`", "", PROMPTS_MARK.sub("", cells[1]))))
     return rows
 
 
@@ -582,8 +680,7 @@ def board_mismatches(view: View, text: str) -> list[str]:
             by_module.setdefault(p.module, []).append(p)
     out = []
     for name, row in board_rows(text):
-        words = re.findall(r"[A-Za-z][\w-]*", name)
-        module = next((m for w in words for m in [pc._alias(w, aliases) or w.lower()] if m in by_module), None)
+        module = row_module(name, set(by_module), aliases)
         if module is None:
             continue
         for clause in _CLAUSE.split(row):
@@ -797,6 +894,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     au = sub.add_parser("audit", help="data problems: no commit, todo left, folder vs status, ids, lower-case folders")
     au.add_argument("--module")
     sub.add_parser("board-check", help="Status Board rows that say HELD/ON MAIN or DEPLOYED/LIVE against a prompt's status")
+    bm = sub.add_parser("board-markers", help="add a generated Prompts: line to the first Status Board row per module")
+    bm.add_argument("--no-commit", action="store_true")
     c = sub.add_parser("claim", help="attach a live session to a prompt (running + session_id; arms its Stop gate)")
     c.add_argument("ref", help="ID, module/ID or file name")
     c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
@@ -842,6 +941,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_audit(view, args)
     if args.cmd == "board-check":
         return cmd_board_check(view, args)
+    if args.cmd == "board-markers":
+        return cmd_board_markers(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))
