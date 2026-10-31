@@ -13,6 +13,7 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
                                           [--notes TEXT] [--needs-owner TEXT] [--comment] [--close] [--no-commit]
     python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]  # prompts × GitHub issues
     python3 scripts/command_center.py audit [--module M]       # exit 1 when it finds something
+    python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts (read-only)
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
@@ -26,6 +27,7 @@ import argparse
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -138,12 +140,20 @@ def render_terminal(view: View) -> str:
         ("Stalled (frontmatter says running, session gone)",
          [(m["module"], p, _last_run(view.runs_of(p), p)) for m in mods for p in m["stalled"]]),
         ("Blocked on owner", [(m["module"], p, meta_str(p, "needs_owner") or meta_str(p, "notes")) for m in mods for p in m["blocked"]]),
-        ("Next up", [(m["module"], m["next"], f"needs owner: {meta_str(m['next'], 'needs_owner') or 'no'}") for m in mods if m["next"]]),
+        ("Next up", [(m["module"], m["next"], f"⚑ needs owner: {owner}" if owner else "")
+                     for m, owner in sorted(((m, owner_ask(m["next"])) for m in mods if m["next"]),
+                                            key=lambda mo: bool(mo[1]))]),
     ]
     for title, rows in sections:
         if rows:
             lines += ["", title] + [_row(mod, p, tail) for mod, p, tail in rows]
     return "\n".join(lines)
+
+
+def owner_ask(p: pc.Prompt) -> str:
+    """What the prompt waits on the owner for, or "" when it needs nothing (``no``, empty, absent)."""
+    v = meta_str(p, "needs_owner").strip()
+    return "" if v.lower() in ("", "no", "none", "false", "-", "—") else v
 
 
 def _last_run(runs: list[dict[str, Any]], p: pc.Prompt) -> str:
@@ -539,6 +549,75 @@ def cmd_audit(view: View, args: argparse.Namespace) -> int:
     return 1 if found else 0
 
 
+_CLAUSE = re.compile(r"\s·\s|;|\||\s—\s|\.\s|[()]")
+_HELD = re.compile(r"\bheld\b|\bon main\b|\bmerged\b|🔵", re.IGNORECASE)
+_LIVE = re.compile(r"\bdeployed\b|\blive\b(?!\s+(?:proof|walk|check|probe|data|call|test|socket))|🟢|🟡", re.IGNORECASE)
+NOT_LIVE = ("pending", "running", "on-branch", "on-main", "blocked")
+
+
+def board_rows(text: str) -> list[tuple[str, str]]:
+    """[(first cell, the State cell)] of every Markdown table row but headers and separators.
+
+    Only the State (second) cell is a status claim; Next and Detail hold plans ("then the held deploys …").
+    """
+    rows = []
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if line.startswith("|") and len(cells) >= 2 and cells[0] and not set(cells[0]) <= set("-:") \
+                and cells[0] not in ("Workstream", "Module"):
+            rows.append((cells[0], re.sub(r"`[^`]*`", "", cells[1])))
+    return rows
+
+
+def board_mismatches(view: View, text: str) -> list[str]:
+    """A row that says HELD/ON MAIN for a deployed/done prompt, or DEPLOYED/LIVE for one that is not live yet.
+
+    A row belongs to the first module its first cell names; a claim is a clause (split at ``·``, ``;``, ``|``)
+    that names the prompt's id and only one kind of status word. Ranges (``H1-H6``) and bare numbers are skipped.
+    """
+    aliases = dict(view.spec.get("module_aliases") or {})
+    by_module: dict[str, list[pc.Prompt]] = {}
+    for p in view.prompts:
+        if p.id and not p.id.isdigit() and p.status not in pc.NOT_COUNTED:
+            by_module.setdefault(p.module, []).append(p)
+    out = []
+    for name, row in board_rows(text):
+        words = re.findall(r"[A-Za-z][\w-]*", name)
+        module = next((m for w in words for m in [pc._alias(w, aliases) or w.lower()] if m in by_module), None)
+        if module is None:
+            continue
+        for clause in _CLAUSE.split(row):
+            held, live = bool(_HELD.search(clause)), bool(_LIVE.search(clause))
+            if held == live:
+                continue
+            for p in by_module[module]:
+                if not re.search(rf"(?<![\w-]){re.escape(p.id)}(?![\w-])", clause):
+                    continue
+                if held and p.status in ("deployed", "done"):
+                    claim = "HELD/ON MAIN"
+                elif live and p.status in NOT_LIVE:
+                    claim = "DEPLOYED/LIVE"
+                else:
+                    continue
+                out.append(f"{name}: says {claim} for {module} {p.id}, which is {p.status}: «{fit(clause.strip(), 100)}»")
+    return list(dict.fromkeys(out))
+
+
+def cmd_board_check(view: View, args: argparse.Namespace) -> int:
+    rel = view.spec.get("status_board")
+    if not rel:
+        print("no status board: set prompts.status_board in the tracker config", file=sys.stderr)
+        return 2
+    try:
+        text = (Path(str(view.spec["repo"])) / str(rel)).read_text()
+    except OSError as e:
+        print(f"{rel}: {e}", file=sys.stderr)
+        return 2
+    found = board_mismatches(view, text)
+    print("\n".join(found) if found else f"board-check: every {rel} row agrees with its prompts")
+    return 1 if found else 0
+
+
 def cmd_sort(view: View, args: argparse.Namespace) -> int:
     """File every prompt under its module's Completed/ or Pending/ folder; a live running prompt stays put."""
     live = pc.live_session_ids(view.sessions, view.now)
@@ -717,6 +796,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     i.add_argument("--no-commit", action="store_true")
     au = sub.add_parser("audit", help="data problems: no commit, todo left, folder vs status, ids, lower-case folders")
     au.add_argument("--module")
+    sub.add_parser("board-check", help="Status Board rows that say HELD/ON MAIN or DEPLOYED/LIVE against a prompt's status")
     c = sub.add_parser("claim", help="attach a live session to a prompt (running + session_id; arms its Stop gate)")
     c.add_argument("ref", help="ID, module/ID or file name")
     c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
@@ -760,6 +840,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_issues(view, args)
     if args.cmd == "audit":
         return cmd_audit(view, args)
+    if args.cmd == "board-check":
+        return cmd_board_check(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))

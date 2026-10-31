@@ -243,3 +243,43 @@ def test_audit_clean_tree_exits_0(center, capsys, tmp_path):
     (root / "Funnels/Funnels-B1-X.md").write_text("---\nstatus: pending\n---\n# B1\n")
     assert run("audit") == 0
     assert "nothing to report" in capsys.readouterr().out
+
+
+STATUS_BOARD = """# Status Board
+
+| Workstream | State | Last landed (main) | Next | Detail |
+|---|---|---|---|---|
+| Funnels backlog B1-B12 | 🟢 B4-B9 live; 🔵 **B11 ON MAIN, deploy HELD** · B12-4 merged, held | `abc` | B13 | x |
+| History module pass | 🟢 **H7 DEPLOYED** 10-30 | `def` | H8 | x |
+| Magnus build reliability | 🟢 B11 live | `123` | — | x |
+"""
+
+
+def test_board_check_flags_rows_that_disagree_with_prompt_status(center, capsys, tmp_path):
+    (center / "docs/Status-Board.md").write_text(STATUS_BOARD)
+    c = json.loads((tmp_path / "config.json").read_text())
+    c["prompts"]["status_board"] = "docs/Status-Board.md"
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    before = (center / "docs/Status-Board.md").read_text()
+    assert run("board-check") == 1
+    out = capsys.readouterr().out
+    assert 'Funnels backlog B1-B12: says HELD/ON MAIN for funnels B11, which is deployed' in out
+    assert 'History module pass: says DEPLOYED/LIVE for history H7, which is running' in out
+    assert "B12-4" not in out  # pending prompt, "held" claim: not a contradiction of a deployed/done one
+    assert "Magnus" not in out  # a row that names no module is skipped
+    assert (center / "docs/Status-Board.md").read_text() == before  # never edits the prose
+
+
+def test_next_up_ranks_prompts_needing_no_owner_first(center, capsys):
+    (center / "docs/Prompts/history/History-H9-Next.md").write_text(
+        "---\nstatus: pending\norder: 9\nneeds_owner: cost OK\n---\n# H9: next\n")
+    (center / "docs/Prompts/history/History-H7-Polish.md").write_text("---\nstatus: done\norder: 7\n---\n# H7\n")
+    (center / "docs/Prompts/history/History-H8b-Paid-Paths-Without-Rows.md").write_text("---\nstatus: done\n---\n# H8b\n")
+    (center / "docs/Prompts/funnels/Funnels-B12-4-Webinar.md").write_text(
+        "---\nstatus: pending\norder: 9d\nneeds_owner: \"no\"\n---\n# B12-4: webinar honesty\n")
+    assert run() == 0
+    out = capsys.readouterr().out
+    nxt = out.split("Next up", 1)[1].strip().splitlines()
+    b12, h9 = (next(i for i, line in enumerate(nxt) if ident in line) for ident in ("B12-4", "H9"))
+    assert b12 < h9 and h9 == len(nxt) - 1  # the one that needs the owner comes last
+    assert "⚑ needs owner: cost OK" in nxt[h9] and "needs owner" not in nxt[b12]
