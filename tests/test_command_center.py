@@ -175,6 +175,10 @@ def test_claim_attaches_a_live_session_and_arms_the_gate(center, capsys):
 def test_claim_refuses_a_gone_session_or_a_finished_prompt(center, capsys):
     assert run("claim", "history/H7", "--session", "gone0000-0000", "--no-commit") == 2
     assert "not a live session" in capsys.readouterr().err
+    write_sessions(center.parent / "tracker", [session("ended000-3333", state="ended"), session("stale000-4444", seen=300)])
+    for sid in ("ended000-3333", "stale000-4444"):
+        assert run("claim", "funnels/B12-4", "--session", sid, "--no-commit") == 2
+        assert "not a live session" in capsys.readouterr().err
     assert run("claim", "funnels/B11", "--session", "d60450f0-1111", "--no-commit") == 2
     assert "deployed" in capsys.readouterr().err
     assert "status: deployed" in (center / "docs/Prompts/funnels/Funnels-B11-Perf.md").read_text()

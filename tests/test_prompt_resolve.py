@@ -70,6 +70,7 @@ def test_legacy_path_resolves_to_its_own_rel(proj):
     ("why are there 63 app files?", False),
     ("why is docs/Prompts/funnels/X.md stalled, did the run die", False),
     ("review docs/Prompts/funnels/X.md", False),
+    ("why did the run of docs/Prompts/funnels/X.md stop", False),  # a question, verb within six words
     ("do not run docs/Prompts/funnels/X.md yet", False),
     ("read the notes and the log first then run X.md", False),  # the verb is the 9th word
     ("docs/Prompts/funnels/X.md has a typo", False),

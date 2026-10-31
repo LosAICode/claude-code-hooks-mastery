@@ -38,6 +38,8 @@ def issues_proj(tmp_path, monkeypatch):
         {"number": 605, "state": "OPEN", "title": "[Ops] CC3: command center",
          "body": "Prompt: `docs/Prompts/ops/Ops-CC3-Center.md`\n\nmore"},
         {"number": 579, "state": "OPEN", "title": "[API Connections] Epic: audit", "body": "R7, R8, R9"},
+        {"number": 610, "state": "OPEN", "title": "[Ops] CC9: nothing", "body": ""},
+        {"number": 611, "state": "OPEN", "title": "[Ops] CC9: nothing again", "body": ""},
     ]
     CALLS.clear()
     monkeypatch.setattr(pi, "fetch_issues", lambda repo: gh_issues)
@@ -85,7 +87,7 @@ def test_issues_fix_writes_keys_it_can_match_and_commits(issues_proj, capsys):
     assert run("issues", "--fix") == 0
     assert meta(issues_proj, "Connections-R9-Meta.md")["issue"] == "582"
     assert meta(issues_proj, "Ops-CC3-Center.md", "ops")["issue"] == "605"
-    assert "issue" not in meta(issues_proj, "Ops-CC9-Nothing.md", "ops")
+    assert "issue" not in meta(issues_proj, "Ops-CC9-Nothing.md", "ops")  # two issues name it: the owner picks
     assert meta(issues_proj, "Connections-R7-Zapier.md")["issue"] == "580"  # never rewritten
     assert git(issues_proj, "log", "-1", "--format=%s") == "docs(prompts): issues --fix: 2 issue keys (connections R9; ops CC3)"
     assert CALLS == []  # nothing created or changed on GitHub

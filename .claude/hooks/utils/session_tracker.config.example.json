@@ -34,6 +34,7 @@
     "gate": false,
     "commit_claims": true,
     "unit_map": "scripts/deploy_units.json",
+    "status_board": "docs/Status-Board.md",
     "main_branch": "main",
     "sync_lock": "/tmp/project-git-sync.lock",
     "sync_every_hours": 0,

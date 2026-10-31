@@ -48,6 +48,7 @@ Flat `key: value` lines (YAML-compatible; lists as `[a, b]`; a value a YAML read
 | `needs_owner`, `cost`, `depends_on` | what the owner must decide, what the run costs, ids that must be done first |
 | `session_id`, `commit`, `deployed`, `updated`, `notes` | who claimed it, the landing commit, when it went live, last change, one line |
 | `todo: confirm` | written by `migrate` when it could not read the old README row: check the status by hand |
+| `issue` | the prompt's GitHub issue (an int, a quoted number or a list); one issue per prompt |
 
 A file without frontmatter is `pending`. Progress = done + deployed over everything except skipped and superseded.
 The view also derives two states: a `pending` prompt with a live session on it shows as `running`, and a `running`
@@ -59,10 +60,16 @@ prompt whose session is gone shows as `stalled`.
 python3 scripts/command_center.py                 # summary per module, then Running now / Stalled / Blocked on owner / Next up
 python3 scripts/command_center.py --module M      # every prompt of one module (order, id, status, owner, session, commit, updated, title)
 python3 scripts/command_center.py --all           # every module, including skipped and superseded
-python3 scripts/command_center.py --json          # for scripts (ops checks)
+python3 scripts/command_center.py --json          # for scripts (ops checks); --json --prompts adds every prompt with its frontmatter
 python3 scripts/command_center.py --board         # rewrite the status block of every module README + the root board; prints what changed
 python3 scripts/command_center.py --html          # write the HTML dashboard (prompts.html, default ~/.claude/session-tracker/command-center.html)
-python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA] [--deployed TS] [--notes TEXT] [--needs-owner TEXT] [--no-commit]
+python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA] [--deployed TS] [--notes TEXT] [--needs-owner TEXT]
+                                  [--clear KEY]… [--comment] [--close] [--no-commit]
+python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand (running + session_id + its Stop gate)
+python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
+python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]
+python3 scripts/command_center.py audit [--module M]      # exit 1 when it finds something
+python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts; exit 1 on a mismatch
 python3 scripts/command_center.py sort [--dry-run] [--no-commit]   # file every prompt under Completed/ or Pending/
 python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 ```
@@ -72,16 +79,55 @@ age a stalled prompt or spot a blocked one whose session is gone.
 
 `set` updates the frontmatter, regenerates that module's table and the board, and commits those files with a
 pathspec (`docs(prompts): <module> <ID> → <status>`), because an uncommitted edit in a shared tree blocks any later
-merge that touches the file. `--no-commit` leaves the files for your own commit. "Next up" is the first `pending`
-prompt by `order` whose `depends_on` are all done.
+merge that touches the file. `--no-commit` leaves the files for your own commit. `--needs-owner ""` and `--clear KEY`
+remove a key (never `status` or `updated`). `--comment` posts one comment to the prompt's issue (`<module> <ID>: <old> →
+<new> · commit · deployed · notes`); `--close` closes the issue with that comment and works only with `done`,
+`skipped` or `superseded`. "Next up" is the first `pending` prompt per module by `order` whose `depends_on` are all done;
+prompts that need nothing from the owner come first, the others are marked `⚑ needs owner: …`.
+
+`claim` attaches a session that is live in the tracker (full id or a unique prefix) to a prompt: it writes `running` and
+`session_id`, records the claim in the session's tracker file so its Stop gate applies, and commits. It refuses a gone
+session, a prompt another live session holds, and anything past `blocked` (a prompt never moves backwards).
+
+**`deploy-check`** answers "is it live?" per unit. For each `on-main` and `deployed` prompt it reads the commits in
+`commit:`, finds where each landed on main (the first first-parent commit that contains it: a branch commit lands at
+its merge, not at its author time), lists the files that landing brought, and maps them to units with the project's
+map (`unit_map`; NeuroGenServer `scripts/deploy_units.json`, which `ops_drift.py` reads too: one map, owner decision
+10-30). A file needs the units of every rule it matches; a `live_at_merge` rule (static files) is live when it lands;
+a file no rule matches needs no unit. A unit counts when it started (`systemctl show`, read-only) after the latest
+landing that needs it. States: **live** (every needed unit), **half** (some), **waiting** (none), **no-unit** (docs,
+tests, scripts), **unchecked** (no commit, or a commit not on main, e.g. another repo's). `--apply` sets an `on-main`
+prompt that is live to `deployed` with `deployed:` = the last needed unit's start, and commits; it never touches a
+`deployed` prompt and never moves one back. A start time is the unit's latest start, so `live since` can be later than
+the real moment. `--json` is what `ops_drift.py` reads for `drift-prompt-half-live-<module>-<id>` (half live > 24 h).
+
+**`issues`** reads `gh issue list --state all` and lists: prompts with no issue (with the issues whose title names
+them), issues that name a prompt whose `issue:` doesn't list them, prompts named by several issues, state mismatches
+(a done/skipped/superseded prompt with an open issue; a pending/running/blocked/on-branch one with a closed issue)
+and `issue:` numbers GitHub doesn't have. An issue names a prompt by its body's `Prompt: <path>` line (old paths
+resolve through `_moved.json`), else by its title, `[Module] ID: …` (`[API Connections] R7:` → connections R7).
+`--fix` writes `issue:` only for a prompt without one that exactly one issue names. Nothing here creates an issue:
+creating them is outward-facing, so the owner OKs the list first.
+
+**`audit`** flags `on-main`/`deployed`/`done` with no commit, a `todo:` left over, a file whose `Pending/` or
+`Completed/` folder disagrees with its status, a prompt with no id (so `set <module>/<ID>` can't reach it), an id two
+live prompts share, and a lower-case module folder holding prompts (module folders are capitalized).
+
+**`board-check`** reads the hand-written board (`status_board`) and, for each table row whose first cell names a
+module, splits its State cell into clauses (at `·`, `;`, `|`, parentheses; code spans dropped). A clause that names
+a prompt id with only HELD/ON MAIN/merged/🔵 words, while the prompt is `deployed`/`done`, is flagged, and so is one
+with only DEPLOYED/LIVE/🟢/🟡 words while the prompt is not live yet. Ranges (`H1-H6`) and bare numbers are skipped;
+"live proof/walk/check" is not a status. It prints the rows and never edits the board's prose.
 
 ## What the hooks do
 
-- **Claim.** On a session's first message, when it names a prompt file and starts with a claim verb (`run`, `execute`,
-  `start`), the tracker marks that prompt `running` with the session id (and commits it with a pathspec when
-  `commit_claims` is on). Only `pending`, `blocked` and `running`-with-a-dead-session prompts can be claimed; a prompt
-  never moves backwards. A first message that merely mentions a prompt ("look at X.md") records `prompt_mentioned` and
-  claims nothing. The claim costs about 60 ms once per session (113 prompts, 80 tracker files).
+- **Claim.** On a session's first message that names a prompt file, the tracker marks that prompt `running` with the
+  session id (and commits it with a pathspec when `commit_claims` is on) when a claim verb (`run`, `execute`, `start`)
+  is among the first six words (`analyze and execute X`, `Run plan and execute X`) or the message is only a prompt
+  path (backticks allowed). A question (`why is X stalled`, first word why/what/how/did/is/…) or a negation before the
+  verb (`do not run X`) never claims. Only `pending`, `blocked` and `running`-with-a-dead-session prompts can be
+  claimed; a prompt never moves backwards. A first message that merely mentions a prompt ("look at X.md", "review
+  X.md") records `prompt_mentioned` and claims nothing; `claim` attaches such a session by hand. The claim costs about 60 ms once per session (113 prompts, 80 tracker files).
 - **Gate.** With `prompts.gate` on, a Stop is blocked once per session when the session claimed a prompt, has commits
   or deploys, and the prompt is still `running` under its id. The message names the `set` command. It never blocks a
   session that only stopped to ask a question (no commits), and a read error lets the stop through (logged).
@@ -99,6 +145,8 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `status_folders` | `true`: `set` files prompts under `Completed/` / `Pending/` (see Layout) |
 | `module_aliases` | file-name prefix or folder name → module (`Sock → security`, `Organization → org-roles`), case-insensitive |
 | `sync_lock`, `sync_every_hours` | an auto-commit daemon's lock file and cadence; `migrate` refuses to run near it |
+| `unit_map`, `main_branch` | `deploy-check`: the project's path → unit map (repo-relative JSON) and the branch it lands on (default `main`) |
+| `status_board` | `board-check`: the hand-written Status Board (repo-relative) |
 
 ## Migration
 
