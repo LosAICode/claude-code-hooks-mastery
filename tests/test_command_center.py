@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -384,6 +385,13 @@ def test_every_live_session_is_listed_even_when_its_prompt_is_past_running(cente
     assert "f2f2f2f2  WAITING ON YOU" in other and "(no prompt) look at the logs" in other
     assert "d60450f0" not in other and "c5588aac" not in other, "Running now already lists these"
     assert "ended000" not in out
+    assert run("--json") == 0
+    others = json.loads(capsys.readouterr().out)["other_sessions"]
+    assert [o["session"].split()[0] for o in others] == ["f2f2f2f2", "e1e1e1e1"]  # newest first
+    assert "(no prompt) look at the logs" in others[0]["prompt"]
+    assert run("--html") == 0
+    page = Path(capsys.readouterr().out.strip().splitlines()[-1]).read_text()
+    assert "Other live sessions" in page and "f2f2f2f2" in page and "ended000" not in page
 
 
 def test_set_pending_or_blocked_releases_the_sessions_hold_on_the_prompt(center, capsys):

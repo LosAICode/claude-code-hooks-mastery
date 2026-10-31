@@ -29,6 +29,8 @@ STALE_AFTER_S = 2 * 3600
 HIDE_ENDED_AFTER_S = 24 * 3600
 MAX_COMMITS = 200
 MAX_DEPLOYS = 100
+MAX_COMMITS_PER_COMMAND = 20
+PENDING_MAX_AGE_S = 3600
 LOG_MAX_BYTES = 1_000_000
 
 DEFAULT_BLOCK_REASON = (
@@ -46,6 +48,11 @@ _PROMPT_FILE = re.compile(r"(?:~|\.{0,2}/|\b)[\w.~/-]*/[\w.-]+\.md\b")
 _GIT_SUBCMD = re.compile(
     r"\bgit\s+(?:-C\s+(\S+)\s+|-c\s+\S+\s+)*(commit|merge|cherry-pick|revert|am)\b"
 )
+_COMMAND_CENTER = re.compile(r"\bcommand_center\.py\b")
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?(?:\n\s*\2[ \t]*(?=\n|$)|\Z)", re.S)
+_SEPARATOR_CHARS = set(";&|()")
+_SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 _CD = re.compile(r"(?:^|[;&|(]\s*)cd\s+([^\s;&|)]+)")
 _WORKTREE_ADD = re.compile(
     r"\bgit\s+(?:-C\s+\S+\s+)?worktree\s+add\s+(?:(?:-b|-B)\s+\S+\s+|--?[\w-]+\s+)*([^\s;&|-][^\s;&|]*)"
@@ -246,15 +253,83 @@ def _git_dir_for_commit(command: str, cwd: str, worktree: str | None) -> str | N
     return worktree or cwd
 
 
+def _commit_dirs(command: str, cwd: str, worktree: str | None, cfg: dict[str, Any]) -> list[str]:
+    """Repos this command may commit in: a git commit/merge/… target, and the prompts repo for command_center.py."""
+    dirs = []
+    git_dir = _git_dir_for_commit(command, cwd, worktree)
+    if git_dir:
+        dirs.append(git_dir)
+    spec = cfg.get("prompts")
+    if isinstance(spec, dict) and spec.get("repo") and _COMMAND_CENTER.search(command):
+        dirs.append(os.path.normpath(str(spec["repo"])))
+    return list(dict.fromkeys(dirs))
+
+
+def _segments(command: str) -> list[list[str]]:
+    """The command's simple commands as word lists: heredoc bodies dropped, split on ; && || | & ( ), `$(` and newlines."""
+    import shlex
+
+    # A newline ends a command; inside a quoted string the ";" stays literal text.
+    text = _HEREDOC.sub("\n", command).replace("\\\n", " ").replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:  # an unclosed quote: split on the separators by hand
+        tokens = re.findall(r"[;&|()]+|[^\s;&|()]+", text)
+    out: list[list[str]] = [[]]
+    for tok in tokens:
+        if set(tok) <= _SEPARATOR_CHARS:  # shlex glues a run: `);`, `&&`, `|&`
+            out.append([])
+        else:
+            out[-1].append(tok)
+    return [seg for seg in out if seg]
+
+
+def _skip_opts(words: list[str], i: int, with_value: tuple[str, ...] = ()) -> int:
+    while i < len(words) and words[i].startswith("-") and words[i] != "--":
+        i += 2 if words[i] in with_value else 1
+    return i + 1 if i < len(words) and words[i] == "--" else i
+
+
+def _executed(words: list[str], depth: int = 0) -> list[list[str]]:
+    """The words from the command word on, after env assignments and wrappers (sudo, flock, nice, bash -c, …)."""
+    i = 0
+    while i < len(words):
+        w = os.path.basename(words[i])
+        if _ENV_ASSIGN.match(words[i]) or words[i] in _SHELL_KEYWORDS:
+            i += 1
+        elif w in ("sudo", "env", "nohup", "exec", "time", "command"):
+            i = _skip_opts(words, i + 1, ("-u", "-g"))
+        elif w == "nice":
+            i = _skip_opts(words, i + 1, ("-n",))
+        elif w == "timeout":
+            i = _skip_opts(words, i + 1, ("-s", "-k")) + 1  # + the duration
+        elif w == "flock":
+            i = _skip_opts(words, i + 1, ("-w", "-E", "--timeout", "--conflict-exit-code")) + 1  # + the lock file
+        elif w in ("bash", "sh"):
+            if "-c" in words[i + 1:] and depth < 3:
+                j = words.index("-c", i + 1)
+                return [x for seg in _segments(" ".join(words[j + 1:j + 2])) for x in _executed(seg, depth + 1)]
+            i = _skip_opts(words, i + 1, ("-o", "-O"))
+        else:
+            return [words[i:]]
+    return []
+
+
 def deploy_matches(command: str, patterns: list[str]) -> list[str]:
+    """Patterns that match where a command is EXECUTED: at the command word, never in an argument or a heredoc."""
     hits = []
+    runs = [run for seg in _segments(command) for run in _executed(seg)]
     for pat in patterns:
-        try:
-            m = re.search(pat, command)
-        except re.error:
-            continue
-        if m:
-            hits.append(m.group(0)[:60])
+        for run in runs:
+            try:
+                m = re.search(pat, " ".join(run))
+            except re.error:
+                break
+            if m and m.start() < len(run[0]):
+                hits.append(m.group(0)[:60])
+                break
     return hits
 
 
@@ -315,9 +390,9 @@ def _on_bash(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str, Any],
         _refresh_branch(data, git)
     data["last_cwd"] = cwd
 
-    git_dir = _git_dir_for_commit(command, cwd, data.get("worktree"))
-    if git_dir:
-        _record_commit(data, git_dir, git)
+    pending = (data.get("pending_heads") or {}).pop(_pending_key(payload, command), None)
+    for git_dir, before in ((pending or {}).get("heads") or {}).items():
+        _record_commits(data, git_dir, before, git)
 
     hits = deploy_matches(command, list(cfg.get("deploy_patterns") or []))
     if hits:
@@ -326,22 +401,51 @@ def _on_bash(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str, Any],
         ]
 
 
-def _record_commit(data: dict[str, Any], git_dir: str, git: GitRunner) -> None:
+def _pending_key(payload: dict[str, Any], command: str) -> str:
+    import hashlib
+
+    return str(payload.get("tool_use_id") or "cmd:" + hashlib.sha1(command.encode()).hexdigest()[:16])
+
+
+def _snapshot_heads(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str, Any], git: GitRunner) -> None:
+    """PreToolUse: HEAD of each repo this command may commit in, so PostToolUse credits only what it moved."""
+    pending = {k: v for k, v in (data.get("pending_heads") or {}).items()
+               if time.time() - float(v.get("ts") or 0) < PENDING_MAX_AGE_S}
+    command = str((payload.get("tool_input") or {}).get("command") or "")
+    cwd = str(payload.get("cwd") or data.get("last_cwd") or "")
+    heads = {}
+    for git_dir in _commit_dirs(command, cwd, data.get("worktree"), cfg):
+        try:
+            heads[git_dir] = git(git_dir, "rev-parse", "HEAD")[1]
+        except GitError:
+            pass  # not a checkout (yet): nothing to compare against
+    if heads:
+        pending[_pending_key(payload, command)] = {"heads": heads, "ts": time.time()}
+    if pending or data.get("pending_heads"):
+        data["pending_heads"] = pending
+
+
+def _record_commits(data: dict[str, Any], git_dir: str, before: str, git: GitRunner) -> None:
+    """Credit the commits HEAD moved through during this command (first parent, oldest first); none if it did not move."""
     try:
-        _, out = git(git_dir, "log", "-1", "--format=%H%x00%ct%x00%s")
-        sha, ct, subject = out.split("\x00", 2)
+        _, after = git(git_dir, "rev-parse", "HEAD")
+        if after == before:
+            return
+        _, out = git(git_dir, "log", "--first-parent", f"-{MAX_COMMITS_PER_COMMAND}", "--format=%H%x00%s",
+                     f"{before}..{after}")
         rid = repo_id(git_dir, git)
-    except (GitError, ValueError) as e:
+    except GitError as e:
         log_error("commit", e)
         return
-    if time.time() - int(ct) > 900:
-        return  # HEAD is older than this command: the commit/merge did not happen
+    rows = [line.split("\x00", 1) for line in reversed(out.splitlines()) if "\x00" in line]
     commits = data.get("commits") or []
-    if any(c.get("sha") == sha for c in commits):
-        return
-    commits.append({"sha": sha, "subject": subject[:80], "repo": rid, "dir": git_dir, "ts": now_iso()})
+    known = {c.get("sha") for c in commits}
+    for sha, subject in rows:
+        if sha in known:
+            continue
+        commits.append({"sha": sha, "subject": subject[:80], "repo": rid, "dir": git_dir, "ts": now_iso()})
+        data["last_commit"] = f"{sha[:9]} {subject[:60]}"
     data["commits"] = commits[-MAX_COMMITS:]
-    data["last_commit"] = f"{sha[:9]} {subject[:60]}"
     if os.path.normpath(git_dir) == os.path.normpath(data.get("worktree") or ""):
         _refresh_branch(data, git)
 
@@ -365,6 +469,8 @@ def apply_event(
         _set_state(data, "working")
     elif event in ("PreToolUse", "PermissionRequest"):
         _set_state(data, "waiting_on_owner", tool_summary(str(payload.get("tool_name") or ""), {}))
+        if event == "PreToolUse" and payload.get("tool_name") == "Bash":
+            _snapshot_heads(data, payload, cfg, git)
     elif event == "PostToolUse":
         _set_state(data, "working")
         name = str(payload.get("tool_name") or "")

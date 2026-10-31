@@ -15,10 +15,28 @@ can override with `SESSION_TRACKER_DIR`. Claude Code's own `~/.claude/sessions/`
 | `task` | The first `.md` path in the session's first prompt, else that prompt's first 80 characters |
 | `state` | `working` (prompt or tool), `waiting_on_owner` (Notification, permission dialog, AskUserQuestion), `idle` (Stop), `ended` (SessionEnd) |
 | `worktree` / `branch` | The last `git worktree add` or `cd` into a git checkout, else the payload's `cwd` |
-| `last_commit`, `commits[]` | A Bash `git commit`/`merge`/`cherry-pick`/`revert`/`am` whose HEAD is new; each entry records its repo |
-| `deploys[]` | Bash commands that match `deploy_patterns` in the config |
+| `last_commit`, `commits[]` | Commits this session's own Bash command made (see "What counts"); each entry records its repo |
+| `deploys[]` | Bash commands that run a `deploy_patterns` match as a command (see "What counts") |
 | `last_tool` | The tool name plus the Bash `description` or the file path. Never the command or its output. |
 | `prompt_file`, `prompt_claimed`, `prompt_prev_status` | The prompt the first message said to run, and whether the tracker marked it `running` (see docs/command-center.md) |
+
+### What counts
+
+- **A commit** is credited only when THIS command made it. On PreToolUse the tracker notes HEAD of each repo the
+  command may commit in: the target of a `git commit|merge|cherry-pick|revert|am` (after `-C` or the last `cd`), plus
+  the `prompts.repo` when the command runs `command_center.py` (`set`, `claim`, `board-markers`, … commit there). On
+  PostToolUse it credits the commits HEAD moved through (`--first-parent before..after`, at most 20, oldest first), so a
+  fast-forward merge and two commits in one command both count. HEAD moved by another session or the auto-sync, a
+  command that commits nothing, or a command with no PreToolUse snapshot credits nothing. One race is left: another
+  session committing in the same repo during the same seconds as a commit of yours that failed.
+- **A deploy** is a `deploy_patterns` match that starts in the command word of a simple command: commands are split on
+  `; && || | & ( )` and newlines, heredoc bodies dropped, and env assignments, `sudo`, `env`, `nohup`, `exec`, `time`,
+  `nice [-n N]`, `timeout N`, `flock [opts] <lock>`, `bash|sh <script>`, `bash|sh -c '<cmd>'` and `do`/`then`/… skipped.
+  So `flock … scripts/restart_web.sh`, `cd x && scripts/restart_web.sh` and `systemctl restart <unit>` are deploys;
+  `grep|cat|sed|tail … restart_web.sh`, `git show …`, `echo "… restart_web.sh"` and `systemctl status|show` are not.
+  A restart started from inside a script or a heredoc (`python3 - <<EOF … subprocess.Popen([...restart_web.sh])`) is
+  not seen either. Replayed over 541 transcript commands that matched the old way (10-31): 439 kept, 102 dropped, all
+  reads, docs or heredoc text but that one.
 
 Run `python3 scripts/sessions.py [--all]` or `/sessions` to see the table, newest first:
 - A session that hasn't ended and hasn't been seen for 2 h shows as `stale?`.

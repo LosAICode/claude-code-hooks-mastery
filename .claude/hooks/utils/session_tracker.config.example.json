@@ -2,7 +2,7 @@
   "_comment": "Copy to ~/.claude/session-tracker/config.json (or point SESSION_TRACKER_CONFIG at it). Keep project paths there, not in this repo.",
   "deploy_patterns": [
     "scripts/deploy\\.sh",
-    "systemctl\\s+restart\\s+myapp"
+    "systemctl\\s+(?:try-)?restart\\s+myapp"
   ],
   "board_gate": {
     "repo": "/path/to/project",

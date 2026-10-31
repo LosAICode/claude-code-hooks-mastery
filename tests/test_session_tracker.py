@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 import session_tracker as st
 from conftest import ROOT, commit_file, git, write_config
 
@@ -86,28 +88,131 @@ def test_worktree_and_branch_follow_cd_and_worktree_add(tracker_env, repo, tmp_p
     assert state()["worktree"] == str(repo) and state()["branch"] == "main"
 
 
+def pre(cmd, tid="t1"):
+    st.track("PreToolUse", payload(tool_name="Bash", tool_use_id=tid, tool_input={"command": cmd}))
+
+
+def post(cmd, tid="t1"):
+    st.track("PostToolUse", payload(tool_name="Bash", tool_use_id=tid, tool_input={"command": cmd}))
+
+
 def test_git_commit_records_sha_subject_and_repo(tracker_env, repo):
+    cmd = f"cd {repo} && git commit -m 'feat: a' -- modules/a.py"
+    pre(cmd)
     sha = commit_file(repo, "modules/a.py", "x = 1", "feat: a")
-    st.track("PostToolUse", payload(tool_name="Bash",
-                                    tool_input={"command": f"cd {repo} && git commit -m 'feat: a' -- modules/a.py"}))
+    post(cmd)
     data = state()
     assert data["last_commit"] == f"{sha[:9]} feat: a"
     assert data["commits"][0]["sha"] == sha
     assert data["commits"][0]["repo"] == st.repo_id(str(repo))
+    assert not data.get("pending_heads")
     # The same command again (nothing new committed) adds no duplicate.
-    st.track("PostToolUse", payload(tool_name="Bash", tool_input={"command": f"git -C {repo} commit -m again"}))
+    pre(f"git -C {repo} commit -m again", "t2")
+    post(f"git -C {repo} commit -m again", "t2")
     assert len(state()["commits"]) == 1
 
 
 def test_old_head_is_not_recorded_as_a_commit(tracker_env, repo):
-    st.track("PostToolUse", payload(tool_name="Bash", tool_input={"command": f"git -C {repo} commit -m nothing"}))
+    pre(f"git -C {repo} commit -m nothing")
+    post(f"git -C {repo} commit -m nothing")
     assert state()["commits"] == [] and state()["last_commit"] is None
+
+
+def test_another_sessions_fresh_commit_is_not_credited(tracker_env, repo):
+    commit_file(repo, "modules/b.py", "y = 1", "docs(prompts): someone else")  # seconds ago, by another session
+    pre(f"cd {repo} && git commit -m mine")  # nothing to commit
+    post(f"cd {repo} && git commit -m mine")
+    # A command that commits nothing, while another session commits in the same tree, credits nothing either.
+    pre(f"git -C {repo} status", "t2")
+    commit_file(repo, "modules/c.py", "z = 1", "auto-sync")
+    post(f"git -C {repo} status", "t2")
+    assert state()["commits"] == [] and state()["last_commit"] is None
+
+
+def test_post_without_pre_credits_nothing(tracker_env, repo):
+    commit_file(repo, "modules/a.py", "x = 1", "feat: a")
+    post(f"git -C {repo} commit -m 'feat: a'")
+    assert state()["commits"] == []
+
+
+def test_fast_forward_merge_is_credited(tracker_env, repo):
+    git(repo, "checkout", "-q", "-b", "feat")
+    sha = commit_file(repo, "modules/m.py", "m = 1", "feat: m")
+    git(repo, "checkout", "-q", "main")
+    cmd = f"git -C {repo} merge --ff-only feat"
+    pre(cmd)
+    git(repo, "merge", "-q", "--ff-only", "feat")
+    post(cmd)
+    assert [c["sha"] for c in state()["commits"]] == [sha]
+
+
+def test_command_center_commit_in_the_prompts_repo_is_credited(tracker_env, repo, tmp_path):
+    write_config(tmp_path, {"prompts": {"repo": str(repo), "root": "docs/Prompts"}})
+    code = f"cd {repo} && git commit -m 'feat: code' -- modules/a.py"
+    cmd = f"{code} && python3 /x/scripts/command_center.py set ops/CC5 done --commit abc"
+    pre(cmd)
+    a = commit_file(repo, "modules/a.py", "x = 1", "feat: code")
+    b = commit_file(repo, "docs/Prompts/ops/CC5.md", "done", "docs(prompts): ops CC5 done")
+    post(cmd)
+    data = state()
+    assert [c["sha"] for c in data["commits"]] == [a, b]  # both commits of the one command, oldest first
+    assert data["last_commit"].startswith(b[:9])
+    # A command_center read (no commit) credits nothing.
+    pre("python3 /x/scripts/command_center.py --module ops", "t2")
+    post("python3 /x/scripts/command_center.py --module ops", "t2")
+    assert len(state()["commits"]) == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -n neurogen-deploy-freeze scripts/restart_web.sh",
+    "cat scripts/restart_web.sh",
+    "sed -n 1,5p /opt/p/scripts/restart_web.sh",
+    'echo "then run scripts/restart_web.sh"',
+    "git show HEAD -- scripts/restart_web.sh",
+    "git diff HEAD -- scripts/restart_web.sh | head",
+    "tail -50 scripts/restart_web.sh; ls scripts",
+    "cat <<'EOF' > notes.md\nscripts/restart_web.sh\nsystemctl restart neurogenserver\nEOF",
+    "systemctl status neurogenserver-celery",
+    "systemctl show neurogenserver -p ActiveEnterTimestamp && systemctl is-active neurogenserver",
+    "grep 'systemctl restart neurogenserver' docs/x.md",
+    "grep x 2>&1 scripts/restart_web.sh",
+    'echo "unbalanced scripts/restart_web.sh',
+    "grep -n x \\\n  scripts/restart_web.sh",
+    "ls\n  grep y scripts/restart_web.sh\n# scripts/restart_web.sh",
+    "python3 - <<'PY'\nimport os\nos.system('scripts/restart_web.sh')\nPY",
+])
+def test_reading_a_deploy_script_is_not_a_deploy(cmd):
+    assert st.deploy_matches(cmd, PATTERNS) == []
+
+
+@pytest.mark.parametrize("cmd", [
+    "flock /run/lock/neurogen-aa-deploy.lock scripts/restart_web.sh",
+    "cd /opt/p && scripts/restart_web.sh",
+    "systemctl restart neurogenserver-celery",
+    "systemctl try-restart neurogenserver-channels",
+    "sudo nice -n 10 /opt/p/scripts/restart_web.sh 2>&1 | tail -5",
+    "bash -c 'scripts/restart_web.sh'",
+    "X=1 timeout 600 bash scripts/restart_web.sh",
+    "cat scripts/restart_web.sh; flock -w 30 /run/lock/x.lock scripts/restart_web.sh",
+    "scripts/restart_web.sh 2>&1 | tail -5",
+    "ls\nscripts/restart_web.sh",
+    "L=x.log; before=$(wc -l < $L); systemctl restart neurogenserver-celery-beat.service; echo done",
+    "R=$(psql -c \"select 1\"); [ \"$R\" = 0 ] || { echo busy; exit 3; }; systemctl restart neurogenserver.service; "
+    "case \"$s\" in *'\"ok\"'*) echo",  # an unclosed quote further on
+    "for u in celery channels; do systemctl restart neurogenserver-$u; done",
+])
+def test_executing_a_deploy_command_is_a_deploy(cmd):
+    assert st.deploy_matches(cmd, PATTERNS)
+
+
+PATTERNS = [r"scripts/restart_web\.sh", r"systemctl\s+(?:try-)?restart\s+neurogenserver"]
 
 
 def test_deploy_patterns_come_from_config(tracker_env, tmp_path):
     write_config(tmp_path, {"deploy_patterns": [r"scripts/restart_app\.sh"]})
     st.track("PostToolUse", payload(tool_name="Bash", tool_input={"command": "flock /x scripts/restart_app.sh"}))
     st.track("PostToolUse", payload(tool_name="Bash", tool_input={"command": "ls scripts"}))
+    st.track("PostToolUse", payload(tool_name="Bash", tool_input={"command": "grep x scripts/restart_app.sh"}))
     deploys = state()["deploys"]
     assert len(deploys) == 1 and deploys[0]["match"] == "scripts/restart_app.sh"
 

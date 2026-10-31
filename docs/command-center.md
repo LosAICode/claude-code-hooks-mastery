@@ -76,7 +76,8 @@ python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 ```
 
 `--json` lists `running`, `stalled` and `blocked` prompts with `updated`, `session_id` and `session_live`, so a check can
-age a stalled prompt or spot a blocked one whose session is gone.
+age a stalled prompt or spot a blocked one whose session is gone. `other_sessions` (and a card in `--html`) holds the
+live sessions "Running now" leaves out, as in the terminal view: `{prompt, session}` text, newest first.
 
 `set` updates the frontmatter, regenerates that module's table and the board, and commits those files with a
 pathspec (`docs(prompts): <module> <ID> → <status>`), because an uncommitted edit in a shared tree blocks any later

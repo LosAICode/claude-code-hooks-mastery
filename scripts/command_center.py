@@ -222,6 +222,8 @@ def render_json(view: View, with_prompts: bool = False) -> str:
                      "age_s": r["age_s"] if r else None} for m in mods for p, r in m["running"]],
         "stalled": [brief(p) for m in mods for p in m["stalled"]],
         "blocked": [{**brief(p), "needs_owner": meta_str(p, "needs_owner")} for m in mods for p in m["blocked"]],
+        "other_sessions": [{"prompt": " ".join(what.split()), "session": " ".join(who.split())}
+                           for what, who in other_live_sessions(view, {r["sid"] for m in mods for _, r in m["running"] if r})],
     }
     if with_prompts:
         data["prompts"] = [{"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "title": p.title,
@@ -368,7 +370,12 @@ def render_html(view: View) -> str:
     blocked = [(m["module"], p) for m in view.modules for p in m["blocked"]]
     chips = [f"<span class=chip>▶ {len(running)} running</span>", f"<span class=chip>⚠ {len(stalled)} stalled</span>",
              f"<span class=chip>🔴 {len(blocked)} blocked on owner</span>"]
+    others = other_live_sessions(view, {r["sid"] for _, _, r in running if r})
     cards = []
+    if others:
+        cards.append("<section class=card><h2>Other live sessions <small>prompt past running, or none</small></h2><table>"
+                     + "".join(f"<tr><td>{e(' '.join(what.split()))}</td><td><code>{e(' '.join(who.split()))}</code></td></tr>"
+                               for what, who in others) + "</table></section>")
     for m in view.modules:
         pct = int(round(100 * m["finished"] / m["total"])) if m["total"] else 0
         rows = []
