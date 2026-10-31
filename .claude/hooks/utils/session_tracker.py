@@ -41,6 +41,7 @@ DEFAULT_PROMPT_REASON = (
     "done|deployed|on-main|on-branch|blocked --commit <sha> --notes '<one line>'` "
     "(it commits the prompt, its module README and the board with a pathspec)."
 )
+STATUS_COMMIT_PREFIX = "docs(prompts):"  # command_center.py's own commits: status, not a prompt's work
 _PROMPT_CENTER_MODULE = "prompt_center"  # sibling module; imported lazily so a bug there never breaks tracking
 DEFAULT_CLAIM_VERBS = ["run", "execute", "start"]
 
@@ -391,8 +392,14 @@ def _on_bash(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str, Any],
     data["last_cwd"] = cwd
 
     pending = (data.get("pending_heads") or {}).pop(_pending_key(payload, command), None)
+    made = []
     for git_dir, before in ((pending or {}).get("heads") or {}).items():
-        _record_commits(data, git_dir, before, git)
+        made += _record_commits(data, git_dir, before, git)
+    if made and data.get("prompt_claimed") and data.get("prompt_file"):
+        try:
+            _credit_prompt(data, made, cfg, git)
+        except Exception as e:
+            log_error("credit_prompt", e)
 
     hits = deploy_matches(command, list(cfg.get("deploy_patterns") or []))
     if hits:
@@ -425,29 +432,70 @@ def _snapshot_heads(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str
         data["pending_heads"] = pending
 
 
-def _record_commits(data: dict[str, Any], git_dir: str, before: str, git: GitRunner) -> None:
-    """Credit the commits HEAD moved through during this command (first parent, oldest first); none if it did not move."""
+def _record_commits(data: dict[str, Any], git_dir: str, before: str, git: GitRunner) -> list[dict[str, Any]]:
+    """Credit the commits HEAD moved through during this command (first parent, oldest first); none if it did not move.
+
+    Returns the rows it added."""
     try:
         _, after = git(git_dir, "rev-parse", "HEAD")
         if after == before:
-            return
+            return []
         _, out = git(git_dir, "log", "--first-parent", f"-{MAX_COMMITS_PER_COMMAND}", "--format=%H%x00%s",
                      f"{before}..{after}")
         rid = repo_id(git_dir, git)
     except GitError as e:
         log_error("commit", e)
-        return
+        return []
     rows = [line.split("\x00", 1) for line in reversed(out.splitlines()) if "\x00" in line]
     commits = data.get("commits") or []
     known = {c.get("sha") for c in commits}
+    added = []
     for sha, subject in rows:
         if sha in known:
             continue
-        commits.append({"sha": sha, "subject": subject[:80], "repo": rid, "dir": git_dir, "ts": now_iso()})
+        added.append({"sha": sha, "subject": subject[:80], "repo": rid, "dir": git_dir, "ts": now_iso()})
         data["last_commit"] = f"{sha[:9]} {subject[:60]}"
-    data["commits"] = commits[-MAX_COMMITS:]
+    data["commits"] = (commits + added)[-MAX_COMMITS:]
     if os.path.normpath(git_dir) == os.path.normpath(data.get("worktree") or ""):
         _refresh_branch(data, git)
+    return added
+
+
+def _is_status_commit(subject: str) -> bool:
+    return str(subject or "").startswith(STATUS_COMMIT_PREFIX)
+
+
+def _credit_prompt(data: dict[str, Any], rows: list[dict[str, Any]], cfg: dict[str, Any], git: GitRunner) -> None:
+    """Append the claimed prompt's work to its ``commits:``: commits in the prompts repo, not a status commit and
+    not one that touches only the prompts tree (CC7: R4's fix landed unrecorded, so deploy-check called R4 live)."""
+    spec = cfg.get("prompts")
+    if not isinstance(spec, dict) or not spec.get("repo"):
+        return
+    repo = str(spec["repo"])
+    rid = repo_id(repo, git)
+    root = str(spec.get("root") or "").strip("/") + "/"
+    shas = []
+    for c in rows:
+        if c.get("repo") != rid or _is_status_commit(c.get("subject") or ""):
+            continue
+        files = _changed_files(str(c.get("dir") or repo), c["sha"], git)
+        if files and all(f.startswith(root) for f in files):
+            continue
+        shas.append(c["sha"])
+    if not shas:
+        return
+    import importlib
+
+    pc = importlib.import_module(_PROMPT_CENTER_MODULE)
+    rel = str(data["prompt_file"])
+    added = pc.add_commits(spec, rel, shas)
+    if not added or not spec.get("commit_claims", True):
+        return
+    if not (Path(repo) / rel).exists():
+        rel = pc.moved_map(spec).get(rel, rel)
+    meta, _, _ = pc.parse_frontmatter(pc._read_head(Path(repo) / rel))
+    label = " ".join(str(x) for x in (meta.get("module"), meta.get("id")) if x) or os.path.basename(rel)
+    pc.commit_prompt_files(spec, [rel], f"{STATUS_COMMIT_PREFIX} {label} commits +" + " +".join(added))
 
 
 def apply_event(
@@ -635,7 +683,47 @@ def prompt_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None, 
         prompt=rel, ref=os.path.basename(rel).replace(" ", "\\ "), script=script)
 
 
-GATES = (("board_gate", gate_reason), ("prompt_gate", prompt_gate_reason))
+DEFAULT_PROGRESS_REASON = (
+    "You committed code on `{prompt}` since its last update. Say how far it is: `python3 {script} set {ref} "
+    "running --progress <done>/{total}` (or the final status, as above)."
+)
+
+
+def progress_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None, cfg: dict[str, Any]) -> str | None:
+    """Ask once for ``--progress`` when the claimed prompt is still running and the session committed code after the
+    prompt's ``updated`` (claim, last ``set``). It waits until the status gate has had its one turn (it runs first,
+    so the two never ask in the same stop)."""
+    spec = cfg.get("prompts")
+    if not isinstance(spec, dict) or not spec.get("gate") or not session or payload.get("stop_hook_active"):
+        return None
+    if session.get("progress_gate_blocked") or not session.get("prompt_gate_blocked"):
+        return None
+    if not session.get("prompt_claimed") or not session.get("prompt_file"):
+        return None
+    import importlib
+
+    pc = importlib.import_module(_PROMPT_CENTER_MODULE)
+    repo = Path(str(spec["repo"]))
+    rel = str(session["prompt_file"])
+    if not (repo / rel).exists():
+        rel = pc.moved_map(spec).get(rel, rel)
+    text = (repo / rel).read_text(errors="replace")
+    meta, body, _ = pc.parse_frontmatter(text)
+    if meta.get("status") != "running" or str(meta.get("session_id") or "") != str(session.get("session_id")):
+        return None
+    since = parse_iso(str(meta.get("updated") or "")) or 0
+    code = [c for c in session.get("commits") or []
+            if not _is_status_commit(c.get("subject") or "") and (parse_iso(c.get("ts")) or 0) > since]
+    if not code:
+        return None
+    total = pc.do_items(body) or "<total>"
+    script = Path(__file__).resolve().parents[3] / "scripts" / "command_center.py"
+    return str(spec.get("progress_message") or DEFAULT_PROGRESS_REASON).format(
+        prompt=rel, ref=os.path.basename(rel).replace(" ", "\\ "), script=script, total=total)
+
+
+# progress_gate runs before prompt_gate: it asks only after the status gate's one block, never in the same stop
+GATES = (("board_gate", gate_reason), ("progress_gate", progress_gate_reason), ("prompt_gate", prompt_gate_reason))
 
 
 def sync_session_log(cfg: dict[str, Any]) -> bool:

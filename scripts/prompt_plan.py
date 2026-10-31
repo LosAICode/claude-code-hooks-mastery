@@ -14,6 +14,7 @@ from typing import Any
 
 import prompt_center as pc
 import prompt_deploy as pd
+import prompt_issues as pi
 
 BUSY = ("running", "on-branch")
 _FREE = re.compile(r"\b(?:no|0|zero)\s+(?:AI\s+)?credits?\b|\bno\b[^;,.()]*\bbuilds?\b", re.IGNORECASE)
@@ -113,8 +114,12 @@ def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.Hist
     groups = umap.get("groups") or {}
     units = {u for e in picked for u in e["waits"]}
     mig_dir = str(dep.get("migrations") or "").rstrip("/")
-    # a live prompt's migration ran at its units' boot: listed apart, not to apply again
-    migrations = [{"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f, "applied_at_boot": e["state"] == "live"}
+    # a migration ran at boot once every unit ITS commit needs started after that commit landed (live 10-31: R4's
+    # migration ran at the 10:53 boot while a later fix of R4 still waited on web): listed apart, not to apply again
+    def booted(e: dict[str, Any], c: dict[str, Any]) -> bool:
+        return e["state"] == "live" or bool(c["needs"]) and all((e["starts"].get(u) or 0) >= c["landed"] for u in c["needs"])
+
+    migrations = [{"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f, "applied_at_boot": booted(e, c)}
                   for e in picked for c in e["commits"] for f in c.get("files") or []
                   if mig_dir and f.startswith(mig_dir + "/")]
     restart, ready = dep.get("restart") or {}, dep.get("ready") or {}
@@ -134,11 +139,116 @@ def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.Hist
                       "guards": [g for g in dep.get("guards") or [] if name in (g.get("before") or [])
                                  or any(u in (g.get("before") or []) for u in members)]})
     by_rel = {p.rel: p for p in prompts}
+    untested = [{"module": e["module"], "id": e["id"], "rel": e["rel"], "why": why}
+                for e in picked if e["rel"] in by_rel for why in [untested_why(by_rel[e["rel"]], e, history)] if why]
     return {"prompts": picked, "units": sorted(units), "migrations": migrations, "migrate": dep.get("migrate"),
+            "untested": untested,
             "guards": list(dep.get("guards") or []), "steps": steps,
             "proofs": [proof_row(by_rel[e["rel"]]) for e in picked if e["rel"] in by_rel],
             "note": None if dep else "no `deploy` block in the unit map: the map's own unit order, plain "
                                      "`systemctl restart`, no guards or proofs (docs/command-center.md)"}
+
+
+def untested_why(p: pc.Prompt, e: dict[str, Any], history: pd.History) -> str | None:
+    """Why the prompt's ``tests:`` does not prove what ships, or None. ``none: <why>`` is a docs/config landing."""
+    tests = str(p.meta.get("tests") or "").strip()
+    if not tests:
+        return "no tests: line (`set … --tests <results file>`)"
+    if tests.startswith("none:"):
+        return None
+    shas = pc._SHA.findall(tests.rsplit(" · ", 1)[-1])
+    if not shas:
+        return f"tests: names no sha ({tests[:60]})"
+    got, why = history.landing(shas[-1])
+    if got is None:
+        return f"the tested {shas[-1]} is not what ships ({why})"
+    later = [c["sha"] for c in e["commits"] if c["landed"] > got["landed"]]
+    return f"{', '.join(later)} landed after the tested {shas[-1]}" if later else None
+
+
+def read_verdict(path: Path) -> tuple[str | None, str | None]:
+    """(the ``SUMMARY`` line of a ``scripts/run_tests.py`` results file, None) or (None, why it is no pass).
+
+    A ``.txt`` is the printed run (its last SUMMARY line); a ``.json`` is ``--out`` (its tally)."""
+    import json
+
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as e:
+        return None, f"{path}: unreadable ({type(e).__name__})"
+    if path.suffix == ".json":
+        try:
+            data = json.loads(text)
+            tally = {str(k): int(v) for k, v in data["tally"].items()}
+            files = len(data.get("results") or [])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, f"{path}: not a run_tests.py --out file"
+        bad = tally.get("NEW-FAILURES", 0) + tally.get("BROKEN", 0)
+        summary = ("SUMMARY " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+                   + f" | files={files} | {'FAIL' if bad else 'OK'}")
+    else:
+        lines = [ln.strip() for ln in text.splitlines() if ln.startswith("SUMMARY ")]
+        if not lines:
+            return None, f"{path}: no SUMMARY line (not a run_tests.py results file?)"
+        summary = lines[-1]
+    if not summary.endswith("| OK"):
+        return None, f"{path}: {summary} (a failing run proves nothing)"
+    return summary, None
+
+
+# --- audit: commits nobody recorded --------------------------------------------------------------------
+
+
+def unrecorded_commits(prompts: list[pc.Prompt], repo: str, branch: str = "main",
+                       umap: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Commits on ``branch`` whose subject names a prompt (``#<issue>`` or ``<module> <ID>``), made since that
+    prompt's first commit, that no prompt's ``commits:`` lists, nor a recorded merge brought in (live 10-31:
+    R4's fix ``766d43595`` "(R4, #576)" was never recorded). Status commits (``docs(prompts):``) are skipped, and
+    with a unit map so is a commit that needs no unit (docs, tests): deploy-check would not miss it."""
+    out = _git(repo, "log", branch, "--format=%H%x00%P%x00%ct%x00%s")
+    if not out:
+        return []
+    rows = [line.split("\x00", 3) for line in out.splitlines() if line.count("\x00") == 3]
+    info = {sha: (parents.split(), int(ct), subject) for sha, parents, ct, subject in rows}
+    by7: dict[str, list[str]] = {}
+    for sha in info:
+        by7.setdefault(sha[:7], []).append(sha)
+
+    def full(short: str) -> str | None:
+        hits = [s for s in by7.get(short[:7], []) if s.startswith(short)]
+        return hits[0] if len(hits) == 1 else None
+
+    brought: dict[str, set[str]] = {}
+
+    def merged_in(sha: str) -> set[str]:
+        if sha not in brought:
+            listed = _git(repo, "rev-list", f"{sha}^1..{sha}") if len(info[sha][0]) > 1 else ""
+            brought[sha] = set((listed or "").split()) - {sha}
+        return brought[sha]
+
+    recorded = {f for p in prompts for s in pc.commits_of(p.meta) for f in [full(s)] if f}
+    covered = set(recorded)
+    for sha in recorded:
+        covered |= merged_in(sha)
+    found = []
+    for p in prompts:
+        firsts = [f for s in pc.commits_of(p.meta) for f in [full(s)] if f]
+        if not p.id or not firsts:
+            continue
+        since = min(info[f][1] for f in firsts)
+        names = [rf"#{n}\b" for n in pi.issues_of(p.meta)] + [rf"\b{re.escape(p.module)}\s+{re.escape(p.id)}\b"]
+        pattern = re.compile("|".join(names), re.IGNORECASE)
+        for sha, (_, ct, subject) in info.items():
+            if ct < since or sha in covered or subject.startswith("docs(prompts):") or not pattern.search(subject):
+                continue
+            if merged_in(sha) & recorded:
+                continue  # a merge that brought a recorded commit in
+            if umap is not None:
+                units, at_merge = pd.needs((_git(repo, "diff", "--name-only", f"{sha}^1", sha) or "").split(), umap)
+                if not units and not at_merge:
+                    continue
+            found.append({"prompt": p, "sha": sha, "subject": subject, "ts": ct})
+    return sorted(found, key=lambda r: (r["prompt"].rel, r["ts"]))
 
 
 # --- next --------------------------------------------------------------------------------------------------

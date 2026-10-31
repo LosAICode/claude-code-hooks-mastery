@@ -46,7 +46,7 @@ import prompt_issues as pi  # noqa: E402
 from session_tracker import attach_prompt, load_config, release_prompt, tracker_dir  # noqa: E402
 
 BEGIN, END = "<!-- status:begin -->", "<!-- status:end -->"
-COLUMNS = [("order", 5), ("id", 6), ("status", 10), ("needs owner", 18), ("session", 16), ("commit", 10),
+COLUMNS = [("order", 5), ("id", 6), ("status", 16), ("needs owner", 18), ("session", 16), ("commit", 10),
            ("issue", 9), ("updated", 10), ("title", 40)]
 TABLE_HEADER = "| # | Prompt | Status | Owner | Commit | Issue | Updated | Notes |\n|---|---|---|---|---|---|---|---|\n"
 BOARD_HEADER = "| Module | Done | Progress | Running | Pending | Blocked |\n|---|---|---|---|---|---|\n"
@@ -166,8 +166,8 @@ def render_terminal(view: View) -> str:
     if not mods:
         lines.append("(no prompts found; check the prompts block of the tracker config)")
     sections = [
-        ("Running now", [(m["module"], p, f"{r['sid8']}  {r['state']}  {age(r['age_s'])}" + (f"  @{r['branch']}" if r.get("branch") else "")
-                         if r else "?") for m in mods for p, r in m["running"]]),
+        ("Running now", [(m["module"], p, (f"{r['sid8']}  {r['state']}  {age(r['age_s'])}" + (f"  @{r['branch']}" if r.get("branch") else "")
+                          if r else "?") + progress_tail(p)) for m in mods for p, r in m["running"]]),
         ("Stalled (frontmatter says running, session gone)",
          [(m["module"], p, _last_run(view.runs_of(p), p)) for m in mods for p in m["stalled"]]),
         ("Blocked on owner", [(m["module"], p, meta_str(p, "needs_owner") or meta_str(p, "notes")) for m in mods for p in m["blocked"]]),
@@ -205,7 +205,7 @@ def render_module(view: View, modules: list[dict[str, Any]], show_all: bool) -> 
         for p, status in m["prompts"]:
             if status in pc.NOT_COUNTED and not show_all:
                 continue
-            cells = [p.order or "", p.id or "", status, meta_str(p, "needs_owner"), run_cell(view.runs_of(p)),
+            cells = [p.order or "", p.id or "", status + progress_tail(p).replace("  ", " "), meta_str(p, "needs_owner"), run_cell(view.runs_of(p)),
                      commit_cell(p), ", ".join(str(n) for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10],
                      p.title or p.name]
             out.append("  ".join(fit(c, w).ljust(w) for c, (_, w) in zip(cells, COLUMNS)).rstrip())
@@ -221,7 +221,8 @@ def render_json(view: View, with_prompts: bool = False) -> str:
     def brief(p: pc.Prompt) -> dict[str, Any]:
         sid = p.meta.get("session_id")
         return {"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "session_id": sid,
-                "session_live": bool(sid) and str(sid) in live, "updated": p.meta.get("updated")}
+                "session_live": bool(sid) and str(sid) in live, "updated": p.meta.get("updated"),
+                "progress": p.meta.get("progress")}
 
     data = {
         "now": datetime.fromtimestamp(view.now).astimezone().isoformat(timespec="seconds"),
@@ -261,6 +262,7 @@ def render_module_table(view: View, m: dict[str, Any]) -> str:
         if status in ("running", "stalled"):
             who = live[0]["sid8"] if live else str(p.meta.get("session_id") or (runs[0]["sid8"] if runs else ""))[:8]
             st += f" ({who})" if who else ""
+        st += progress_tail(p).replace("  ", " ")
         commit = commit_cell(p)
         cells = [p.order or "", f"`{p.name}`", st, meta_str(p, "needs_owner"), f"`{commit}`" if commit else "",
                  ", ".join(f"#{n}" for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10], _cell(meta_str(p, "notes") + (" · todo: confirm" if p.meta.get("todo") else ""))]
@@ -396,7 +398,7 @@ def render_html(view: View) -> str:
             rows.append(
                 f"<tr><td class=muted>{e(p.order or '')}</td><td><b>{e(p.id or '')}</b> {e(p.title or p.name)}"
                 f"<br><span class=muted>{e(p.name)}</span></td>"
-                f"<td class='s s-{e(status)}'>{e(pc.MARKS.get(status, ''))} {e(status)}</td>"
+                f"<td class='s s-{e(status)}'>{e(pc.MARKS.get(status, ''))} {e(status)}{e(progress_tail(p).replace('  ', ' '))}</td>"
                 f"<td>{e(who)}</td><td>{e(meta_str(p, 'needs_owner'))}</td>"
                 f"<td><code>{e(commit_cell(p))}</code></td><td>{e(meta_str(p, 'notes'))}</td></tr>")
         cards.append(
@@ -439,10 +441,19 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     if args.close and args.status not in pc.CLOSED:
         print(f"--close closes the issue of a finished prompt ({', '.join(pc.CLOSED)}), not {args.status}", file=sys.stderr)
         return 2
+    tests = tests_value(p, args)
+    if tests is False:
+        return 2
+    progress = progress_value(p, args.progress)
+    if args.tests is None and args.no_tests is None and args.status == "on-main":
+        print(f"warning: no --tests: {p.module} {p.id or p.name} lands on main with no test verdict "
+              "(--tests <results file> or --no-tests \"<why>\"); deploy-plan lists it as not proven tested", file=sys.stderr)
+    if args.notes is None and p.meta.get("notes"):
+        print(f"notes kept: {meta_str(p, 'notes')}  (--notes replaces them)")
     try:
         clear = list(args.clear or []) + (["needs_owner"] if args.needs_owner == "" else [])
         pc.set_status(view.spec, p.rel, args.status, clear=clear, commit=args.commit, deployed=args.deployed,
-                      notes=args.notes, needs_owner=args.needs_owner or None)
+                      notes=args.notes, needs_owner=args.needs_owner or None, tests=tests, progress=progress)
         moved = pc.place(view.spec, p.rel, args.status)[1] if view.spec.get("status_folders") else []
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
@@ -459,6 +470,46 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     if args.comment or args.close:
         return post_progress(view, p, args)
     return 0
+
+
+def tests_value(p: pc.Prompt, args: argparse.Namespace) -> str | None | bool:
+    """The ``tests:`` line to store: "<SUMMARY> · <results file> · <sha tested>", "<text> · <sha>", "none: <why>";
+    None = leave it; False = refused (printed). The sha: --tested, else --commit, else the prompt's last commit."""
+    import prompt_plan as pp
+
+    if args.no_tests is not None:
+        return f"none: {args.no_tests}"
+    if args.tests is None:
+        return None
+    sha = args.tested or args.commit or (pc.commits_of(p.meta) or [None])[-1]
+    if not sha:
+        print(f"--tests: {p.module} {p.id or p.name} names no commit; pass --tested <sha> (or --commit)", file=sys.stderr)
+        return False
+    path = Path(args.tests).expanduser()
+    if not path.is_file():
+        return f"{args.tests} · {sha[:9]}"
+    summary, why = pp.read_verdict(path)
+    if summary is None:
+        print(f"--tests refused: {why}", file=sys.stderr)
+        return False
+    return f"{summary} · {path.resolve()} · {sha[:9]}"
+
+
+def progress_value(p: pc.Prompt, value: str | None) -> str | None:
+    """``3/6``, ``3/6 tests red`` as given; a bare ``3`` gets the numbered items under ``## Do`` as its total."""
+    import prompt_plan as pp
+
+    if value is None:
+        return None
+    value = value.strip()
+    if re.fullmatch(r"\d+", value):
+        total = pc.do_items(pp.body_of(p))
+        return f"{value}/{total}" if total else value
+    return value
+
+
+def progress_tail(p: pc.Prompt) -> str:
+    return f"  {meta_str(p, 'progress')}" if p.meta.get("progress") else ""
 
 
 def post_progress(view: View, p: pc.Prompt, args: argparse.Namespace) -> int:
@@ -566,7 +617,13 @@ def cmd_claim(view: View, args: argparse.Namespace) -> int:
     return 0
 
 
+STALE_NOTES = re.compile(r"\b(?:queued|pending|waiting|todo|blocked)\b", re.IGNORECASE)
+
+
 def audit_findings(view: View, module: str | None = None) -> list[str]:
+    import prompt_deploy as pd
+    import prompt_plan as pp
+
     prompts = [p for p in view.prompts if not module or p.module == module]
     out = []
     for p in prompts:
@@ -580,6 +637,25 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
             out.append(f"{p.name}: status {raw} but filed under {folder}/ (`command_center.py sort` moves it)")
         if not p.id and p.status not in pc.NOT_COUNTED:
             out.append(f"{p.name}: no id, so `set <module>/<ID>` can't reach it (add `id:` to its frontmatter)")
+        stale = STALE_NOTES.search(meta_str(p, "notes"))
+        if raw in ("on-main", "deployed", "done") and stale:
+            out.append(f"{pi.label(p)}: {raw} but its notes still say \"{stale.group(0)}\" (stale notes? "
+                       f"`set {p.module}/{p.id or p.name} {raw} --notes '<now>'`)")
+        if raw == "deployed" and not pp.proof_row(p)["proof"]:
+            out.append(f"{pi.label(p)}: deployed with no proof (no `proof:` line, no live bullet under Done when), "
+                       "so `proofs` can't say how to close it")
+    try:
+        umap = pd.load_map(view.spec)
+    except (OSError, ValueError):
+        umap = None
+    for r in pp.unrecorded_commits(view.prompts, str(view.spec["repo"]),
+                                   str(view.spec.get("main_branch") or "main"), umap):
+        q = r["prompt"]
+        if module and q.module != module:
+            continue
+        sha = r["sha"][:9]
+        out.append(f"{pi.label(q)}: commit {sha} \"{fit(r['subject'], 70)}\" is in no prompt's commits: → "
+                   f"command_center.py set {q.module}/{q.id} {q.meta.get('status') or 'pending'} --commit {sha}")
     by_id: dict[tuple[str, str], list[pc.Prompt]] = {}
     for p in prompts:
         if p.id and p.status not in pc.NOT_COUNTED:
@@ -1049,8 +1125,10 @@ def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
     lines += ["", "Migrations (apply BY HAND first, under the guards" + (f": {plan['migrate']}" if plan["migrate"] else "") + ")"]
     todo = [m for m in plan["migrations"] if not m["applied_at_boot"]]
     lines += [f"  {m['file']}  ({m['module']} {m['id']}, {m['sha']})" for m in todo] or ["  none"]
-    lines += [f"  (ran at boot, the prompt is live: {m['file']}, {m['module']} {m['id']})"
+    lines += [f"  (ran at boot, its units started after it landed: {m['file']}, {m['module']} {m['id']})"
               for m in plan["migrations"] if m["applied_at_boot"]]
+    lines += ["", "Not proven tested (no passing verdict for what ships; `set … --tests <results file>`)"]
+    lines += [f"  {fit(u['module'] + ' ' + (u['id'] or u['rel']), 22):<23}{u['why']}" for u in plan["untested"]] or ["  none"]
     lines += ["", "Guards (each must read as expected before the first restart)"]
     lines += [f"  {g['name']}: {g['command']}  → expect {g.get('expect', '')}" for g in plan["guards"] if not g.get("before")] or ["  none in the map"]
     lines += ["", "Restarts (one at a time, each proven before the next)"]
@@ -1123,6 +1201,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--commit")
     s.add_argument("--deployed")
     s.add_argument("--notes")
+    s.add_argument("--tests", metavar="FILE|TEXT", help="the run_tests.py results file (its SUMMARY must say OK), or a verdict")
+    s.add_argument("--tested", metavar="SHA", help="with --tests: the commit tested (default: --commit, else its last commit)")
+    s.add_argument("--no-tests", dest="no_tests", metavar="WHY", help="a landing with nothing to test (docs, config)")
+    s.add_argument("--progress", metavar="N[/M] [text]", help="how far a running prompt is; M defaults to its ## Do items")
     s.add_argument("--needs-owner", dest="needs_owner")
     s.add_argument("--clear", action="append", metavar="KEY", help="remove a frontmatter key (repeatable)")
     s.add_argument("--no-commit", action="store_true")

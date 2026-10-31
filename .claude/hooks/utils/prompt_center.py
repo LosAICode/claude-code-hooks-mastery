@@ -19,7 +19,8 @@ from typing import Any
 
 KNOWN_KEYS = (
     "module", "id", "order", "title", "status", "needs_owner", "cost", "depends_on",
-    "session_id", "commits", "commit", "deployed", "updated", "notes", "todo", "issue", "proof", "after", "run_last",
+    "session_id", "progress", "commits", "commit", "tests", "deployed", "updated", "notes", "todo", "issue", "proof", "after",
+    "run_last",
 )
 MAX_FRONTMATTER_LINES = 60
 _SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -93,6 +94,16 @@ def commits_of(meta: dict[str, Any]) -> list[str]:
         text = " ".join(str(v) for v in value) if isinstance(value, list) else str(value or "")
         shas += _SHA.findall(text)
     return list(dict.fromkeys(shas))
+
+
+def do_items(body: str) -> int:
+    """How many numbered items the body's ``Do`` section lists (the default total of ``set --progress``)."""
+    m = re.search(r"^#+\s*Do\b.*$", body, re.MULTILINE | re.IGNORECASE)
+    if not m:
+        return 0
+    section = body[m.end():]
+    nxt = re.search(r"^#+\s", section, re.MULTILINE)
+    return len(re.findall(r"^\d+\.\s", section[:nxt.start()] if nxt else section, re.MULTILINE))
 
 
 def _mtime_ns(path: Path) -> int:
@@ -654,6 +665,29 @@ def set_status(spec: dict[str, Any], rel: str, status: str, clear: list[str] | t
     if meta is None:
         raise OSError(f"{rel} changed while writing (or no longer {expect}); not written")
     return meta
+
+
+def add_commits(spec: dict[str, Any], rel: str, shas: list[str]) -> list[str]:
+    """Append ``shas`` (9 characters) to a prompt's ``commits`` list; status and ``updated`` stay as they are.
+
+    The session tracker calls it with the commits a claimed session made. A prompt filed elsewhere since the claim
+    is found through ``_moved.json``. Returns the shas added (none already listed, by prefix either way).
+    """
+    spec = _spec(spec)
+    repo = Path(str(spec["repo"]))
+    if not (repo / rel).exists():
+        rel = moved_map(spec).get(rel, rel)
+    path = repo / rel
+    with _PromptLock(_lock_dir(spec), rel):
+        meta, _, _ = parse_frontmatter(_read_head(path))
+        have = commits_of(meta)
+        new = [s[:9] for s in shas if not any(h.startswith(s[:9]) or s.startswith(h) for h in have)]
+        new = list(dict.fromkeys(new))
+        if not new:
+            return []
+        if write_meta(path, {"commits": have + new, "commit": None}) is None:
+            raise OSError(f"{rel} changed while writing; commits not added")
+    return new
 
 
 def commit_prompt_files(spec: dict[str, Any], rels: list[str], message: str, attempts: int = 3) -> str | None:

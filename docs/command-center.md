@@ -47,7 +47,9 @@ Flat `key: value` lines (YAML-compatible; lists as `[a, b]`; a value a YAML read
 | `status` | `pending` ⚪ · `running` ▶ · `on-branch` ◐ (built, not landed) · `on-main` 🔵 (landed, deploy held) · `deployed` 🟡 (live, proof open) · `done` 🟢 · `blocked` 🔴 (owner) · `skipped` (refuted / do not run) · `superseded` (`notes: by …`) |
 | `needs_owner`, `cost`, `depends_on` | what the owner must decide (`inbox`; "answered …" closes it), what the run costs (`inbox`, `proofs` rank it: free · unknown · paid), ids that must be done first |
 | `session_id`, `commits`, `deployed`, `updated`, `notes` | who claimed it, every commit it shipped (`[sha, …]`; `set --commit` appends; the older single `commit:` is still read and folded in on the next `set`), when it went live, last change, one line |
-| `proof` | optional: what proves it live (script, probe account, cost); else `proofs` uses the first "live" bullet under `## Done when` |
+| `progress` | how far a running prompt is: `"3/6"` or `"3/6 tests red"` (`set … running --progress 3/6`; a bare `3` takes the numbered items under `## Do` as its total). Shown in the view, `--module`, the module tables, the HTML and `--json` |
+| `tests` | the verdict behind a landing: `"<SUMMARY line> · <results file> · <sha tested>"` (`set --tests`), `"<text> · <sha>"`, or `"none: <why>"` (`--no-tests`, a docs/config landing). `deploy-plan` lists what it would ship without one |
+| `proof` | recommended for a new prompt (optional for old ones): what proves it live (script, probe account, cost); else `proofs` uses the first "live" bullet under `## Done when` |
 | `after`, `run_last` | optional: `[ID, …]` that must be done first besides `depends_on`; `true` = not while another prompt of the module runs or is on a branch. Without them `next` reads "Run after <ID>" / "Run last" in the body (a quoted mention is not a hint) |
 | `todo: confirm` | written by `migrate` when it could not read the old README row: check the status by hand |
 | `issue` | the prompt's GitHub issue (an int, a quoted number or a list); one issue per prompt |
@@ -66,6 +68,7 @@ python3 scripts/command_center.py --json          # for scripts (ops checks); --
 python3 scripts/command_center.py --board         # rewrite the status block of every module README + the root board; prints what changed
 python3 scripts/command_center.py --html          # write the HTML dashboard (prompts.html, default ~/.claude/session-tracker/command-center.html)
 python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA] [--deployed TS] [--notes TEXT] [--needs-owner TEXT]
+                                  [--tests FILE|TEXT [--tested SHA] | --no-tests WHY] [--progress N[/M] [text]]
                                   [--clear KEY]… [--comment] [--close] [--no-commit]
 python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand (running + session_id + its Stop gate)
 python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
@@ -124,8 +127,10 @@ or on-branch one). It then lists, report only, Status Board clauses that say "ow
 
 **`deploy-plan`** takes every `on-main` prompt and every `deployed` one that is half live or waiting (a later commit
 not live yet), runs `deploy-check`'s logic on them and prints, in order: the prompts and the units each still waits
-on; the migrations among their commits (files under `deploy.migrations`) to apply BY HAND first (a live prompt's
-migration ran at boot and is shown apart); the guards; one restart step per unit in `deploy.order` that is needed
+on; the migrations among their commits (files under `deploy.migrations`) to apply BY HAND first (one whose own
+commit's units all started after that commit landed ran at boot and is shown apart, even while a later commit of the
+same prompt still waits: R4, 10-31); "Not proven tested": every prompt it ships with no `tests:`, a tested sha that is
+not on main, or a commit that landed after the tested sha; the guards; one restart step per unit in `deploy.order` that is needed
 (a group's own command, e.g. `restart_web.sh` under the deploy lock, else `systemctl restart <unit>` per member), each
 with the guards that must hold right before it (`before:`, e.g. 0 live calls before `-voice`) and its proofs; then
 `deploy-check --apply` and the proofs owed. The project's steps live in the unit map's `deploy` block, not in code:
@@ -164,7 +169,14 @@ creating them is outward-facing, so the owner OKs the list first.
 
 **`audit`** flags `on-main`/`deployed`/`done` with no commit, a `todo:` left over, a file whose `Pending/` or
 `Completed/` folder disagrees with its status, a prompt with no id (so `set <module>/<ID>` can't reach it), an id two
-live prompts share, and a lower-case module folder holding prompts (module folders are capitalized).
+live prompts share, a lower-case module folder holding prompts (module folders are capitalized), and (CC7):
+- an `on-main`/`deployed`/`done` prompt whose `notes:` still say queued/pending/waiting/todo/blocked;
+- a `deployed` prompt with neither `proof:` nor a "live" bullet under `## Done when` (`proofs` can't say how to close it);
+- a commit on main whose subject names a prompt (`#<issue>` or `<module> <ID>`), made since that prompt's first commit,
+  that no prompt's `commits:` lists and no recorded merge brought in, with the `set … --commit <sha>` line that records
+  it (report only: the prompt's owner runs it). Status commits (`docs(prompts):`) and, with a unit map, commits that
+  need no unit (docs, tests) are skipped: deploy-check would not miss them. Live 10-31: R4's fix `766d43595` was never
+  recorded, so deploy-check called R4 live while the fix waited on web.
 
 **`board-check`** reads the hand-written board (`status_board`) and, for each table row whose first cell names a
 module, splits its State cell into clauses (at `·`, `;`, `|`, parentheses; code spans dropped). A clause that names
@@ -188,9 +200,19 @@ the command then says so and the next run catches up. `board-check` ignores the 
   verb (`do not run X`) never claims. Only `pending`, `blocked` and `running`-with-a-dead-session prompts can be
   claimed; a prompt never moves backwards. A first message that merely mentions a prompt ("look at X.md", "review
   X.md") records `prompt_mentioned` and claims nothing; `claim` attaches such a session by hand. The claim costs about 60 ms once per session (113 prompts, 80 tracker files).
+- **Commits.** Each commit a session's own command made in the prompts repo (or one of its worktrees) is appended to
+  the claimed prompt's `commits:` (`pc.add_commits`: status and `updated` untouched; a prompt filed elsewhere since the
+  claim is found through `_moved.json`), then committed with a pathspec as `docs(prompts): <module> <ID> commits +<sha>`
+  when `commit_claims` is on. Skipped: status commits (`docs(prompts):`), commits touching only the prompts tree, and
+  commits in other repos (deploy-check reads only the prompts repo; a hooks-repo prompt still uses `set --commit`).
+  A failure is logged, never raised.
 - **Gate.** With `prompts.gate` on, a Stop is blocked once per session when the session claimed a prompt, has commits
   or deploys, and the prompt is still `running` under its id. The message names the `set` command. It never blocks a
   session that only stopped to ask a question (no commits), and a read error lets the stop through (logged).
+- **Progress gate.** After the status gate has had its one block, a later Stop is blocked once more when the prompt is
+  still `running` under the session and the session committed code (not a status commit) after the prompt's `updated`
+  (its claim or last `set`): it asks for `set … running --progress <done>/<total>`. The two never ask in the same stop.
+  Message override: `prompts.progress_message`.
 
 ## Config
 
