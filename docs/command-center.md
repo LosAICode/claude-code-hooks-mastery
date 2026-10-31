@@ -57,7 +57,7 @@ prompt whose session is gone shows as `stalled`.
 ## Commands
 
 ```
-python3 scripts/command_center.py                 # summary per module, then Running now / Stalled / Blocked on owner / Next up
+python3 scripts/command_center.py                 # summary per module, then Running now / Other live sessions / Stalled / Blocked on owner / Next up
 python3 scripts/command_center.py --module M      # every prompt of one module (order, id, status, owner, session, commit, updated, title)
 python3 scripts/command_center.py --all           # every module, including skipped and superseded
 python3 scripts/command_center.py --json          # for scripts (ops checks); --json --prompts adds every prompt with its frontmatter
@@ -80,7 +80,10 @@ age a stalled prompt or spot a blocked one whose session is gone.
 
 `set` updates the frontmatter, regenerates that module's table and the board, and commits those files with a
 pathspec (`docs(prompts): <module> <ID> → <status>`), because an uncommitted edit in a shared tree blocks any later
-merge that touches the file. `--no-commit` leaves the files for your own commit. `--needs-owner ""` and `--clear KEY`
+merge that touches the file. Setting a prompt `pending` or `blocked` also releases it from every session that held
+it (its tracker `prompt_file` is cleared and the prompt goes into `released_prompts`), so the view stops showing it
+running; a later claim takes it back. The header counts live sessions too: "Other live sessions" lists each one that
+Running now leaves out (its prompt is on-branch, done, …, or it has none). `--no-commit` leaves the files for your own commit. `--needs-owner ""` and `--clear KEY`
 remove a key (never `status` or `updated`). `--comment` posts one comment to the prompt's issue (`<module> <ID>: <old> →
 <new> · commit · deployed · notes`); `--close` closes the issue with that comment and works only with `done`,
 `skipped` or `superseded`. "Next up" is the first `pending` prompt per module by `order` whose `depends_on` are all done;

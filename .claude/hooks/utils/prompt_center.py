@@ -513,7 +513,7 @@ def join(prompts: list[Prompt], sessions: list[dict[str, Any]], cfg: dict[str, A
         rel = s.get("prompt_file")
         if not rel or rel not in by_rel:
             rel = resolve_prompt(str(s.get("task") or ""), cfg, prompts)
-        if rel:
+        if rel and rel not in (s.get("released_prompts") or []):  # set back to pending/blocked by hand
             runs.setdefault(rel, []).append(run_of(s, sid))
         own = by_sid.get(sid)  # the prompt's frontmatter names this session (claimed later or by hand)
         if own and own != rel:

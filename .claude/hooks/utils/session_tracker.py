@@ -398,6 +398,7 @@ def _claim_prompt(data: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> Non
         return
     sid = str(data["session_id"])
     data["prompt_file"] = rel
+    data["released_prompts"] = [r for r in data.get("released_prompts") or [] if r != rel]
     d = tracker_dir()
     live = pc.live_session_ids(pc.load_sessions(d) if d.is_dir() else [], time.time()) - {sid}
     prev = pc.mark_running(spec, rel, sid, live)
@@ -415,7 +416,26 @@ def attach_prompt(session_id: str, rel: str, prev: str | None) -> bool:
         data = load_session(session_id)
         if data is None:
             return False
-        data.update(prompt_file=rel, prompt_claimed=True, prompt_prev_status=prev)
+        data.update(prompt_file=rel, prompt_claimed=True, prompt_prev_status=prev,
+                    released_prompts=[r for r in data.get("released_prompts") or [] if r != rel])
+        write_session(data)
+    return True
+
+
+def release_prompt(session_id: str, rel: str) -> bool:
+    """Drop the session's hold on a prompt set back to pending or blocked (``command_center.py set``).
+
+    The prompt goes into ``released_prompts``, so the view no longer matches the session to it by its task text
+    either; a later claim of the same prompt takes it back.
+    """
+    with _SessionLock(session_id):
+        data = load_session(session_id)
+        if data is None:
+            return False
+        if rel not in (data.get("released_prompts") or []):
+            data["released_prompts"] = [*(data.get("released_prompts") or []), rel]
+        if data.get("prompt_file") == rel:
+            data.update(prompt_file=None, prompt_claimed=False, prompt_prev_status=None)
         write_session(data)
     return True
 

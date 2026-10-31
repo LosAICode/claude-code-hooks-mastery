@@ -39,7 +39,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "hooks" / "utils"))
 import prompt_center as pc  # noqa: E402
 import prompt_issues as pi  # noqa: E402
-from session_tracker import attach_prompt, load_config, tracker_dir  # noqa: E402
+from session_tracker import attach_prompt, load_config, release_prompt, tracker_dir  # noqa: E402
 
 BEGIN, END = "<!-- status:begin -->", "<!-- status:end -->"
 COLUMNS = [("order", 5), ("id", 6), ("status", 10), ("needs owner", 18), ("session", 16), ("commit", 10),
@@ -125,13 +125,34 @@ def _row(module: str, p: pc.Prompt, tail: str) -> str:
     return f"  {module:<14}{(p.id or ''):<7}{fit(p.title or p.name, 36):<36}  {tail}".rstrip()
 
 
+def other_live_sessions(view: View, listed: set[str]) -> list[tuple[str, str]]:
+    """(prompt part, session part) per live session that "Running now" leaves out, newest first: its prompt is
+    past running (on-branch, done, …) or it has none (live 10-31: 6 live sessions, 3 shown)."""
+    live = pc.live_session_ids(view.sessions, view.now)
+    prompt_of = {r["sid"]: p for p in view.prompts for r in view.runs_of(p)}
+    rows = []
+    for s in sorted(view.sessions, key=lambda s: pc._parse_iso(s.get("last_seen")) or 0, reverse=True):
+        sid = str(s["session_id"])
+        if sid not in live or sid in listed:
+            continue
+        p = prompt_of.get(sid)
+        what = (f"{p.module:<14}{(p.id or ''):<7}{fit(p.title or p.name, 36):<36}  {view.status_of(p)}" if p
+                else f"{'-':<14}{'':<7}{fit('(no prompt) ' + str(s.get('task') or ''), 36):<36}")
+        seen = pc._parse_iso(s.get("last_seen")) or view.now
+        rows.append((what, f"{sid[:8]}  {pc.session_display_state(s, view.now)}  {age(max(0, view.now - seen))}"))
+    return rows
+
+
 def render_terminal(view: View) -> str:
     mods = view.modules
     running = sum(len(m["running"]) for m in mods)
     stalled = sum(len(m["stalled"]) for m in mods)
     blocked = sum(len(m["blocked"]) for m in mods)
+    listed = {r["sid"] for m in mods for _, r in m["running"] if r}
+    others = other_live_sessions(view, listed)
     stamp = datetime.fromtimestamp(view.now).strftime("%Y-%m-%d %H:%M")
-    lines = [f"Prompt command center · {stamp} · {running} running · {stalled} stalled · {blocked} blocked on owner", ""]
+    lines = [f"Prompt command center · {stamp} · {running} running · {stalled} stalled · {blocked} blocked on owner"
+             f" · {len(listed) + len(others)} live sessions", ""]
     lines += [module_line(m) for m in mods]
     if not mods:
         lines.append("(no prompts found; check the prompts block of the tracker config)")
@@ -148,6 +169,9 @@ def render_terminal(view: View) -> str:
     for title, rows in sections:
         if rows:
             lines += ["", title] + [_row(mod, p, tail) for mod, p, tail in rows]
+        if title == "Running now" and others:
+            lines += ["", "Other live sessions (prompt past running, or none)"]
+            lines += [f"  {what}  {who}".rstrip() for what, who in others]
     return "\n".join(lines)
 
 
@@ -407,6 +431,10 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
         return 2
+    if args.status in ("pending", "blocked"):
+        # The session that held it lets go, or the view still shows it running (live 10-31, A12)
+        for sid in {r["sid"] for r in view.runs_of(p)}:
+            release_prompt(sid, p.rel)
     if moved:
         print(f"moved to {moved[-2]}")
     print(f"{p.module} {p.id or p.name}: {p.status} → {args.status}")

@@ -366,3 +366,40 @@ def test_board_markers_with_nothing_to_add_commits_nothing(center, capsys, tmp_p
     assert run("board-markers") == 0
     out = capsys.readouterr().out
     assert "none (every module row has one)" in out and "commit" not in out
+
+
+def test_every_live_session_is_listed_even_when_its_prompt_is_past_running(center, capsys):
+    # Live 10-31: 6 live sessions, 3 shown. A session whose prompt is on-branch or done (Security G running its
+    # suites, Funnels B14 waiting on the owner) or that has no prompt dropped out of the view.
+    write_sessions(center.parent / "tracker", [
+        session("e1e1e1e1-5555", prompt_file="docs/Prompts/funnels/Funnels-B11-Perf.md", seen=3),
+        session("f2f2f2f2-6666", state="waiting_on_owner", seen=2, task="look at the logs"),
+        session("ended000-7777", state="ended", prompt_file="docs/Prompts/funnels/Funnels-B11-Perf.md"),
+    ])
+    assert run() == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].endswith("· 1 blocked on owner · 4 live sessions")
+    other = out.split("Other live sessions", 1)[1].split("\n\n", 1)[0]
+    assert "B11" in other and "e1e1e1e1  working" in other and "deployed" in other
+    assert "f2f2f2f2  WAITING ON YOU" in other and "(no prompt) look at the logs" in other
+    assert "d60450f0" not in other and "c5588aac" not in other, "Running now already lists these"
+    assert "ended000" not in out
+
+
+def test_set_pending_or_blocked_releases_the_sessions_hold_on_the_prompt(center, capsys):
+    import session_tracker as st
+
+    # Live 10-31: A12 was set back to pending, but the view kept it running: the claiming session's tracker
+    # file still named it. A session that matched a prompt by its task text is released the same way.
+    assert run("claim", "funnels/B12-4", "--session", "d60450f0", "--no-commit") == 0
+    assert run("set", "funnels/B12-4", "pending", "--clear", "session_id", "--no-commit") == 0
+    h8b = next(p for p in pc.scan(cfg(center)) if p.id == "H8b")
+    assert run("set", "history/H8b", "blocked", "--no-commit") == 0
+    capsys.readouterr()
+    s = st.load_session("d60450f0-1111")
+    assert not s.get("prompt_file") and not s.get("prompt_claimed")
+    assert "docs/Prompts/funnels/Funnels-B12-4-Webinar.md" in s["released_prompts"]
+    assert h8b.rel in st.load_session("c5588aac-2222")["released_prompts"]
+    assert run("--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert not {"B12-4", "H8b"} & {r["id"] for r in data["running"]}
