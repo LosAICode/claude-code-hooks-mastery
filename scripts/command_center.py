@@ -355,6 +355,7 @@ def find_prompt(view: View, ref: str) -> pc.Prompt:
     module = None
     if "/" in ref and not ref.endswith(".md"):
         module, ref = ref.split("/", 1)
+        module = pc._alias(module, view.spec.get("module_aliases") or {}) or module.lower()
     hits = [p for p in view.prompts if (p.name == ref or p.rel == ref or (p.id or "").lower() == ref.lower())
             and (module is None or p.module == module)]
     if not hits:

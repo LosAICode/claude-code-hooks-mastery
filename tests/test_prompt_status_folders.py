@@ -126,6 +126,14 @@ def test_set_done_moves_into_completed_and_commits_every_path(tree, capsys):
     assert "| 1 | `Alpha-A1-First.md` | 🟢 done |" in (tree / ROOT / "Alpha/Alpha-00-README.md").read_text()
 
 
+def test_set_takes_the_module_as_the_folder_names_it(tree, capsys):
+    """`Alpha/A3` (the folder's case) and `Communications/C1` (an aliased folder) find their prompts."""
+    assert run("set", "Alpha/A3", "deployed", "--no-commit") == 0
+    assert "status: deployed\n" in (tree / ROOT / "Alpha/Pending/Alpha-A3-Third.md").read_text()
+    assert run("set", "Communications/C1", "done", "--no-commit") == 0
+    assert "status: done\n" in (tree / ROOT / "Communications/Completed/Comms-C1-Dial.md").read_text()
+
+
 def test_set_back_to_pending_moves_out_of_completed(tree, capsys):
     assert run("set", "alpha/A4", "pending") == 0
     assert (tree / ROOT / "Alpha/Pending/Alpha-A4-Bare.md").is_file()
