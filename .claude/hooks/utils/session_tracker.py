@@ -409,6 +409,17 @@ def _claim_prompt(data: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> Non
         data["prompt_claim_commit"] = pc.commit_prompt_files(spec, [rel], f"docs(prompts): {label} running ({sid[:8]})")
 
 
+def attach_prompt(session_id: str, rel: str, prev: str | None) -> bool:
+    """Record a hand claim (``command_center.py claim``) in the session's file, so its Stop gate applies."""
+    with _SessionLock(session_id):
+        data = load_session(session_id)
+        if data is None:
+            return False
+        data.update(prompt_file=rel, prompt_claimed=True, prompt_prev_status=prev)
+        write_session(data)
+    return True
+
+
 def track(event: str, payload: dict[str, Any]) -> None:
     """Record one hook event for its session. Never raises."""
     try:

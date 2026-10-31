@@ -421,13 +421,31 @@ def resolve_prompt(text: str, cfg: dict[str, Any], index: list[Prompt]) -> str |
     return by_name[best].rel if best else None
 
 
+CLAIM_WINDOW = 6  # a claim verb this early says "run it": `analyze and execute X`, `Run plan and execute X`
+_QUESTION_WORDS = {"why", "what", "when", "where", "who", "how", "did", "does", "do", "is", "was", "should"}
+_NEGATIONS = {"not", "don't", "dont", "never", "without"}
+_BARE_PATH = re.compile(r"[`'\"]*[^\s`'\"]+\.md[`'\"]*", re.IGNORECASE)
+
+
 def claims_prompt(text: str, verbs: list[str]) -> bool:
-    """True when the message's first word is a claim verb (``run``, ``execute``, …): the session is running that prompt."""
-    head = (text or "").lstrip()[:200]
+    """True when the message says to run its prompt, not just mention it.
+
+    A claim verb (``run``, ``execute``, …) among the first six words, or a message that is only a prompt path
+    (backticks allowed). A question (``why is X stalled``) or a negation before the verb never claims.
+    """
+    head = (text or "").strip()[:400]
     if not head or head.startswith("<"):
         return False
-    first = re.split(r"\s+", head, maxsplit=1)[0].strip("`'\"*_:.,;!").lower()
-    return first in {str(v).lower() for v in verbs}
+    if _BARE_PATH.fullmatch(head):
+        return True
+    words = [w.strip("`'\"*_:.,;!?()").lower() for w in head.split()[:CLAIM_WINDOW]]
+    if not words or words[0] in _QUESTION_WORDS:
+        return False
+    wanted = {str(v).lower() for v in verbs}
+    for i, w in enumerate(words):
+        if w in wanted:
+            return not _NEGATIONS.intersection(words[:i])
+    return False
 
 
 # --- sessions × prompts ------------------------------------------------------------------------------

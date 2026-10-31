@@ -11,6 +11,7 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py --html              # write the HTML dashboard, print its path
     python3 scripts/command_center.py set <id|module/id|file> <status> [--commit SHA] [--deployed TS]
                                           [--notes TEXT] [--needs-owner TEXT] [--no-commit]
+    python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 
 Config: the ``prompts`` block of the session tracker config (see docs/command-center.md).
@@ -30,7 +31,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "hooks" / "utils"))
 import prompt_center as pc  # noqa: E402
-from session_tracker import load_config, tracker_dir  # noqa: E402
+from session_tracker import attach_prompt, load_config, tracker_dir  # noqa: E402
 
 BEGIN, END = "<!-- status:begin -->", "<!-- status:end -->"
 COLUMNS = [("order", 5), ("id", 6), ("status", 10), ("needs owner", 18), ("session", 16), ("commit", 10),
@@ -378,20 +379,54 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
         return 2
-    fresh = View(view.cfg, view.now)
-    changed, notes = regenerate(fresh, [p.module])
-    for n in notes:
-        print(n)
-    repo = Path(str(view.spec["repo"]))
-    rels = list(dict.fromkeys([p.rel, *moved] + [str(c.relative_to(repo)) for c in changed]))
     if moved:
         print(f"moved to {moved[-2]}")
     print(f"{p.module} {p.id or p.name}: {p.status} → {args.status}")
-    if args.no_commit:
+    commit_change(view, [p.module], [p.rel, *moved], f"docs(prompts): {p.module} {p.id or p.name} → {args.status}",
+                  args.no_commit)
+    return 0
+
+
+def commit_change(view: View, modules: list[str], rels: list[str], message: str, no_commit: bool) -> str | None:
+    """Regenerate the modules' tables and the board, then commit those files and ``rels`` with a pathspec."""
+    changed, notes = regenerate(View(view.cfg, view.now), modules)
+    for n in notes:
+        print(n)
+    repo = Path(str(view.spec["repo"]))
+    rels = list(dict.fromkeys(rels + [str(c.relative_to(repo)) for c in changed]))
+    if no_commit:
         print("not committed (--no-commit); files: " + ", ".join(rels))
-        return 0
-    sha = pc.commit_prompt_files(view.spec, rels, f"docs(prompts): {p.module} {p.id or p.name} → {args.status}")
+        return None
+    sha = pc.commit_prompt_files(view.spec, rels, message)
     print(f"committed {sha[:9]}: " + ", ".join(rels) if sha else "NOT committed (git refused; commit the files yourself): " + ", ".join(rels))
+    return sha
+
+
+def cmd_claim(view: View, args: argparse.Namespace) -> int:
+    """Attach a live session to a prompt by hand: ``running`` + ``session_id``, and the session's Stop gate applies."""
+    try:
+        p = find_prompt(view, args.ref)
+    except LookupError as e:
+        print(e, file=sys.stderr)
+        return 2
+    live = pc.live_session_ids(view.sessions, view.now)
+    sids = sorted(s for s in live if s == args.session or s.startswith(args.session))
+    if len(sids) != 1:
+        why = "is ambiguous: " + ", ".join(sids) if sids else "is not a live session (no tracker file active in the last 2 h)"
+        print(f"{args.session!r} {why}", file=sys.stderr)
+        return 2
+    sid = sids[0]
+    prev = pc.mark_running(view.spec, p.rel, sid, live - {sid})
+    if prev is None:
+        holder = str(p.meta.get("session_id") or "")[:8]
+        print(f"{p.module} {p.id or p.name} is {p.status}" + (f" ({holder}, live)" if p.status == "running" else "")
+              + ": only pending, blocked or a gone session's running prompt can be claimed", file=sys.stderr)
+        return 2
+    attach_prompt(sid, p.rel, prev)
+    moved = pc.place(view.spec, p.rel, "running")[1] if view.spec.get("status_folders") else []
+    print(f"{p.module} {p.id or p.name}: {prev} → running ({sid[:8]})")
+    commit_change(view, [p.module], [p.rel, *moved], f"docs(prompts): {p.module} {p.id or p.name} running ({sid[:8]}, by hand)",
+                  args.no_commit)
     return 0
 
 
@@ -465,6 +500,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--notes")
     s.add_argument("--needs-owner", dest="needs_owner")
     s.add_argument("--no-commit", action="store_true")
+    c = sub.add_parser("claim", help="attach a live session to a prompt (running + session_id; arms its Stop gate)")
+    c.add_argument("ref", help="ID, module/ID or file name")
+    c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
+    c.add_argument("--no-commit", action="store_true")
     so = sub.add_parser("sort", help="file every prompt under its module's Completed/ or Pending/ folder")
     so.add_argument("--dry-run", action="store_true")
     so.add_argument("--no-commit", action="store_true")
@@ -491,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set(view, args)
     if args.cmd == "sort":
         return cmd_sort(view, args)
+    if args.cmd == "claim":
+        return cmd_claim(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))

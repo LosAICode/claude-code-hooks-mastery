@@ -158,3 +158,29 @@ def test_write_meta_none_removes_key(tmp_path):
     p.write_text("---\nstatus: pending\ntodo: confirm\n---\n# T\n")
     assert pc.write_meta(p, {"todo": None}) == {"status": "pending"}
     assert p.read_text() == "---\nstatus: pending\n---\n# T\n"
+
+
+def test_claim_attaches_a_live_session_and_arms_the_gate(center, capsys):
+    import session_tracker as st
+
+    assert run("claim", "funnels/B12-4", "--session", "d60450f0", "--no-commit") == 0
+    m = pc.parse_frontmatter((center / "docs/Prompts/funnels/Funnels-B12-4-Webinar.md").read_text())[0]
+    assert m["status"] == "running" and m["session_id"] == "d60450f0-1111"
+    s = st.load_session("d60450f0-1111")
+    assert s["prompt_file"] == "docs/Prompts/funnels/Funnels-B12-4-Webinar.md" and s["prompt_claimed"] is True
+    assert s["prompt_prev_status"] == "pending"
+    assert "funnels B12-4: pending → running (d60450f0)" in capsys.readouterr().out
+
+
+def test_claim_refuses_a_gone_session_or_a_finished_prompt(center, capsys):
+    assert run("claim", "history/H7", "--session", "gone0000-0000", "--no-commit") == 2
+    assert "not a live session" in capsys.readouterr().err
+    assert run("claim", "funnels/B11", "--session", "d60450f0-1111", "--no-commit") == 2
+    assert "deployed" in capsys.readouterr().err
+    assert "status: deployed" in (center / "docs/Prompts/funnels/Funnels-B11-Perf.md").read_text()
+
+
+def test_claim_takes_over_a_stalled_prompt(center):
+    assert run("claim", "history/H7", "--session", "c5588aac-2222", "--no-commit") == 0
+    m = pc.parse_frontmatter((center / "docs/Prompts/history/History-H7-Polish.md").read_text())[0]
+    assert m["status"] == "running" and m["session_id"] == "c5588aac-2222"

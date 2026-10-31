@@ -55,9 +55,24 @@ def test_legacy_path_resolves_to_its_own_rel(proj):
     ("run and execute from /docs X.md", True),
     ("Execute docs/Prompts/funnels/X.md", True),
     ("Start docs/Prompts/funnels/X.md", True),
-    ("Please run docs/Prompts/funnels/X.md", False),
+    ("Please run docs/Prompts/funnels/X.md", True),
     ("Look at docs/Prompts/funnels/X.md and fix the typo", False),
     ("<command-name>/sessions</command-name> run X.md", False),
+    # real first messages (CC3, #605)
+    ("analyze and execute Documentation/Prompts/Security/Pending/Security-S4-Modules-Sweep.md", True),
+    ("/opt/neurogenserver/Documentation/Prompts/ops/Ops-CC2-Command-Center-Follow-Ups.md", True),
+    ("`Documentation/Prompts/Ops/Pending/Ops-CC3-Command-Center-Improvements.md`", True),
+    ("  Ops-CC3-Command-Center-Improvements.md\n", True),
+    ("run and execute from /Documentation Funnels-B12-4-Webinar-Honesty.md", True),
+    ("Run plan and execute Connections-C6-Lead-Extractor-Billing.md", True),
+    ("plan and execute docs/Prompts/funnels/X.md", True),
+    ("look at Documentation/Prompts/History/Pending/History-H8d-Last-Paid-Paths.md", False),
+    ("why are there 63 app files?", False),
+    ("why is docs/Prompts/funnels/X.md stalled, did the run die", False),
+    ("review docs/Prompts/funnels/X.md", False),
+    ("do not run docs/Prompts/funnels/X.md yet", False),
+    ("read the notes and the log first then run X.md", False),  # the verb is the 9th word
+    ("docs/Prompts/funnels/X.md has a typo", False),
 ])
 def test_claims_prompt(text, claims):
     assert pc.claims_prompt(text, ["run", "execute", "start"]) is claims

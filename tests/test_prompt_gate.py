@@ -163,3 +163,15 @@ def test_unreadable_prompt_file_lets_the_stop_through(proj):
     (proj / PROMPT).unlink()
     assert st.stop_gate(stop()) is None
     assert "prompt_gate" in (st.tracker_dir() / "tracker.log").read_text()
+
+
+@pytest.mark.parametrize("text", [
+    f"analyze and execute {PROMPT}",
+    f"Run plan and execute {PROMPT.rsplit('/', 1)[1]}",
+    f"`{PROMPT}`",
+])
+def test_verb_in_the_first_words_or_a_bare_path_claims(proj, text):
+    st.track("UserPromptSubmit", prompt_event(text))
+    assert meta(proj)["status"] == "running" and meta(proj)["session_id"] == SID
+    s = st.load_session(SID)
+    assert s["prompt_file"] == PROMPT and s["prompt_claimed"] is True and "prompt_mentioned" not in s
