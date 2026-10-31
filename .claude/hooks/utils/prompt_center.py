@@ -617,8 +617,11 @@ def mark_running(spec: dict[str, Any], rel: str, sid: str, live_sids: set[str]) 
 
 
 def set_status(spec: dict[str, Any], rel: str, status: str, clear: list[str] | tuple[str, ...] = (),
-               **fields: Any) -> dict[str, Any]:
-    """Write ``status`` and the given fields (None = leave alone); ``clear`` names keys to remove."""
+               expect: dict[str, tuple] | None = None, **fields: Any) -> dict[str, Any]:
+    """Write ``status`` and the given fields (None = leave alone); ``clear`` names keys to remove.
+
+    ``expect`` (as in ``write_meta``) makes the write conditional, for callers that decided on an older read.
+    """
     if status not in STATUSES:
         raise ValueError(f"unknown status {status!r}; one of {', '.join(STATUSES)}")
     if {"status", "updated"} & set(clear):
@@ -629,9 +632,9 @@ def set_status(spec: dict[str, Any], rel: str, status: str, clear: list[str] | t
     spec = _spec(spec)
     path = Path(str(spec["repo"])) / rel
     with _PromptLock(_lock_dir(spec), rel):
-        meta = write_meta(path, updates)
+        meta = write_meta(path, updates, expect=expect)
     if meta is None:
-        raise OSError(f"{rel} changed while writing; retry")
+        raise OSError(f"{rel} changed while writing (or no longer {expect}); not written")
     return meta
 
 

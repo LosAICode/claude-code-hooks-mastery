@@ -347,3 +347,22 @@ def test_board_markers_in_a_git_repo_fill_and_commit_in_one_go(center, capsys, t
     assert "<!-- prompts:funnels -->**Prompts:** 🟢 1/5" in board.read_text()
     assert git(center, "status", "--porcelain", "--", "docs/Status-Board.md") == ""
     assert git(center, "log", "-1", "--format=%s").startswith("docs(status-board): generated Prompts: line")
+
+
+def test_set_status_with_expect_never_overwrites_a_status_that_moved(center):
+    spec = pc.prompts_cfg(__import__("session_tracker").load_config())
+    rel = "docs/Prompts/funnels/Funnels-B11-Perf.md"  # deployed
+    with pytest.raises(OSError):
+        pc.set_status(spec, rel, "deployed", expect={"status": ("on-main",)}, deployed="2026-10-30T16:50:00")
+    assert "deployed:" not in (center / rel).read_text()
+    pc.set_status(spec, rel, "done", expect={"status": ("deployed",)})
+    assert "status: done" in (center / rel).read_text()
+
+
+def test_board_markers_with_nothing_to_add_commits_nothing(center, capsys, tmp_path):
+    _with_status_board(center, tmp_path)
+    assert run("board-markers", "--no-commit") == 0
+    capsys.readouterr()
+    assert run("board-markers") == 0
+    out = capsys.readouterr().out
+    assert "none (every module row has one)" in out and "commit" not in out

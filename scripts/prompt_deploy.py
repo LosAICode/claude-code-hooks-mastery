@@ -141,7 +141,9 @@ class History:
             landed = self.first_parent[merge]
             base = (self._git("merge-base", f"{merge}^1", full) or "").strip()
         raw = (self._git("diff", "-z", "--name-only", "--no-renames", base, full) if base
-               else self._git("show", "-z", "--name-only", "--format=", full)) or ""
+               else self._git("show", "-z", "--name-only", "--format=", full))
+        if raw is None:  # an empty list would read as "no unit needed"
+            return None, f"{ref}: its files could not be read"
         return {"sha": full, "landed": landed, "files": [f for f in raw.split("\0") if f.strip()]}, None
 
 
@@ -151,7 +153,7 @@ def commits_of(meta: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(_SHA.findall(text)))
 
 
-def check(prompts: list[Any], spec: dict[str, Any], umap: dict[str, Any], history: History) -> list[dict[str, Any]]:
+def check(prompts: list[Any], umap: dict[str, Any], history: History) -> list[dict[str, Any]]:
     starts: dict[str, int | None] = {}
 
     def start(unit: str) -> int | None:

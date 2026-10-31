@@ -163,3 +163,29 @@ def test_glob_agrees_with_git_ls_files(tmp_path):
     for pattern in ("modules/services/magnus_*", "modules/**", "modules/*", "modules/*.py", "**/a.md", "modules/s*/**"):
         expect = set(git(r, "ls-files", "--", f":(glob){pattern}").splitlines())
         assert {f for f in files if pd.glob_regex(pattern).fullmatch(f)} == expect, pattern
+
+
+def test_unreadable_files_are_unchecked_not_no_unit(deploy, monkeypatch, capsys):
+    real = pd.History._git
+
+    def broken(self, *args):
+        return None if args[0] in ("diff", "show") else real(self, *args)
+
+    monkeypatch.setattr(pd.History, "_git", broken)
+    r = results(capsys)
+    assert r["A10"]["state"] == "unchecked" and "files" in r["A10"]["reason"]
+
+
+def test_apply_leaves_a_prompt_another_session_moved_since_the_scan(deploy, monkeypatch, capsys):
+    real = pd.check
+    a10 = deploy / "docs/Prompts/agents/Agents-A10-X.md"
+
+    def check_then_someone_sets_done(*args):
+        out = real(*args)
+        a10.write_text(a10.read_text().replace("status: on-main", "status: done"))
+        return out
+
+    monkeypatch.setattr(pd, "check", check_then_someone_sets_done)
+    assert run("deploy-check", "--apply") == 0
+    assert "status: done" in a10.read_text() and "deployed:" not in a10.read_text()
+    assert "agents A10: left alone" in capsys.readouterr().out

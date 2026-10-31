@@ -453,9 +453,16 @@ def cmd_issues(view: View, args: argparse.Namespace) -> int:
     if not fixable:
         print("\n--fix: nothing to write (a prompt needs exactly one issue naming it)")
         return 0
+    written = []
     for p, issue in fixable:
-        pc.write_meta(p.path, {"issue": str(issue["number"])})
+        if pc.write_meta(p.path, {"issue": str(issue["number"])}, expect={"issue": (None, "")}) is None:
+            print(f"{pi.label(p)}: changed since the scan; left alone")
+            continue
+        written.append((p, issue))
         print(f"{pi.label(p)}: issue #{issue['number']}")
+    fixable = written
+    if not fixable:
+        return 0
     labels: dict[str, list[str]] = {}
     for p, _ in fixable:
         labels.setdefault(p.module, []).append(p.id or p.name)
@@ -557,8 +564,6 @@ _CLAUSE = re.compile(r"\s·\s|;|\||\s—\s|\.\s|[()]")
 _HELD = re.compile(r"\bheld\b|\bon main\b|\bmerged\b|🔵", re.IGNORECASE)
 _LIVE = re.compile(r"\bdeployed\b|\blive\b(?!\s+(?:proof|walk|check|probe|data|call|test|socket))|🟢|🟡", re.IGNORECASE)
 NOT_LIVE = ("pending", "running", "on-branch", "on-main", "blocked")
-
-
 PROMPTS_MARK = re.compile(r"(<!-- prompts:(?P<mod>[\w-]+) -->)(.*?)(<!-- /prompts -->)")
 
 
@@ -589,15 +594,13 @@ def prompts_line(m: dict[str, Any]) -> str:
 
 def status_board_clean(view: View) -> bool:
     """False when the hand-written board has uncommitted edits (another session's lines we must not commit)."""
-    import subprocess as sp
-
     repo = str(view.spec["repo"])
     try:
-        if sp.run(["git", "-C", repo, "rev-parse", "--git-dir"], capture_output=True, timeout=20).returncode != 0:
+        if subprocess.run(["git", "-C", repo, "rev-parse", "--git-dir"], capture_output=True, timeout=20).returncode != 0:
             return True  # not a git repo: no one else's commit to protect (and `git diff` would compare without an index)
-        return sp.run(["git", "-C", repo, "diff", "--quiet", "HEAD", "--", str(view.spec["status_board"])],
-                      capture_output=True, timeout=20).returncode == 0
-    except (OSError, sp.SubprocessError):
+        return subprocess.run(["git", "-C", repo, "diff", "--quiet", "HEAD", "--", str(view.spec["status_board"])],
+                              capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -649,11 +652,14 @@ def cmd_board_markers(view: View, args: argparse.Namespace) -> int:
             lines[i] = line[:at] + f" <!-- prompts:{module} --><!-- /prompts -->" + line[at:]
             have.add(module)
             added.append(module)
-    if added:  # filled here: once written, the board is dirty and the refresh in commit_change would skip it
-        write_if_changed(path, fill_markers(view, "\n".join(lines)))
-    print("markers added: " + (", ".join(added) if added else "none (every module row has one)"))
-    commit_change(view, [], [str(rel)], f"docs(status-board): generated Prompts: line per module row ({', '.join(added) or 'refresh'})",
-                  args.no_commit or not added)
+    if not added:
+        print("markers added: none (every module row has one)")
+        return 0
+    # filled here: once written, the board is dirty and the refresh in commit_change would skip it
+    write_if_changed(path, fill_markers(view, "\n".join(lines)))
+    print("markers added: " + ", ".join(added))
+    commit_change(view, [], [str(rel)], f"docs(status-board): generated Prompts: line per module row ({', '.join(added)})",
+                  args.no_commit)
     return 0
 
 
@@ -674,8 +680,9 @@ def board_rows(text: str) -> list[tuple[str, str]]:
 def board_mismatches(view: View, text: str) -> list[str]:
     """A row that says HELD/ON MAIN for a deployed/done prompt, or DEPLOYED/LIVE for one that is not live yet.
 
-    A row belongs to the first module its first cell names; a claim is a clause (split at ``·``, ``;``, ``|``)
-    that names the prompt's id and only one kind of status word. Ranges (``H1-H6``) and bare numbers are skipped.
+    A row belongs to the first module its first cell names; a claim is a clause of its State cell (split at ``·``,
+    ``;``, ``—``, ``. ``, parentheses) that names the prompt's id and only one kind of status word. Ranges
+    (``H1-H6``) and bare numbers are skipped.
     """
     aliases = dict(view.spec.get("module_aliases") or {})
     by_module: dict[str, list[pc.Prompt]] = {}
@@ -837,7 +844,7 @@ def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
         return 2
     prompts = [p for p in view.prompts if not args.module or p.module == args.module]
     history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
-    results = pd.check(prompts, view.spec, umap, history)
+    results = pd.check(prompts, umap, history)
     if args.json:
         print(json.dumps({"now": _iso(view.now), "units": {u: s for e in results for u, s in e["starts"].items()},
                           "prompts": results}, indent=1))
@@ -851,11 +858,20 @@ def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
         return 0
     by_rel = {p.rel: p for p in view.prompts}
     rels: list[str] = []
+    applied = []
     for e in ready:
         p = by_rel[e["rel"]]
-        pc.set_status(view.spec, p.rel, "deployed", deployed=_iso(e["live_since"]))
+        try:  # only if still on-main: never over a status another session set since the scan
+            pc.set_status(view.spec, p.rel, "deployed", expect={"status": ("on-main",)}, deployed=_iso(e["live_since"]))
+        except OSError as err:
+            print(f"{p.module} {p.id or p.name}: left alone ({err})")
+            continue
+        applied.append(e)
         rels += [p.rel, *(pc.place(view.spec, p.rel, "deployed")[1] if view.spec.get("status_folders") else [])]
         print(f"{p.module} {p.id or p.name}: on-main → deployed ({_hm(e['live_since'])})")
+    ready = applied
+    if not ready:
+        return 0
     labels: dict[str, list[str]] = {}
     for e in ready:
         labels.setdefault(e["module"], []).append(e["id"] or e["name"])
