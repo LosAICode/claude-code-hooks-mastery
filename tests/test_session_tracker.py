@@ -242,6 +242,18 @@ def test_hooks_write_the_tracker_file(tmp_path):
     assert json.loads((d / f"{SID}.json").read_text())["state"] == "idle"
 
 
+def test_the_hooks_credit_a_commit_made_by_the_bash_command(tmp_path, repo):
+    # Live 10-31: pre_tool_use.py passed only AskUserQuestion to the tracker, so no HEAD snapshot was ever taken.
+    d = tmp_path / "tracker"
+    env = {**os.environ, "SESSION_TRACKER_DIR": str(d), "SESSION_TRACKER_CONFIG": str(tmp_path / "none.json")}
+    bash = payload(tool_name="Bash", tool_use_id="t1", tool_input={"command": f"git -C {repo} commit -m 'feat: a'"})
+    assert _run_hook("pre_tool_use.py", bash, env, tmp_path).returncode == 0
+    assert json.loads((d / f"{SID}.json").read_text())["state"] != "waiting_on_owner"  # a Bash call is not a wait
+    sha = commit_file(repo, "modules/a.py", "x = 1", "feat: a")
+    assert _run_hook("post_tool_use.py", bash, env, tmp_path).returncode == 0
+    assert [c["sha"] for c in json.loads((d / f"{SID}.json").read_text())["commits"]] == [sha]
+
+
 def test_hooks_exit_0_when_the_tracker_cannot_write(tmp_path):
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("")  # mkdir under a file fails

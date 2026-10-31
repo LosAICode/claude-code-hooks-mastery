@@ -114,7 +114,7 @@ def main():
         
         tool_name = input_data.get('tool_name', '')
         tool_input = input_data.get('tool_input', {})
-        if tool_name == 'AskUserQuestion':
+        if tool_name in ('AskUserQuestion', 'Bash'):  # Bash: HEAD snapshot, so only its own commits count
             track("PreToolUse", input_data)
         
         # Check for .env file access (blocks access to sensitive environment files)

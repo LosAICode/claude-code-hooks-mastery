@@ -467,10 +467,10 @@ def apply_event(
             except Exception as e:
                 log_error("claim_prompt", e)
         _set_state(data, "working")
+    elif event == "PreToolUse" and payload.get("tool_name") == "Bash":
+        _snapshot_heads(data, payload, cfg, git)  # not a wait: a permission dialog arrives as PermissionRequest
     elif event in ("PreToolUse", "PermissionRequest"):
         _set_state(data, "waiting_on_owner", tool_summary(str(payload.get("tool_name") or ""), {}))
-        if event == "PreToolUse" and payload.get("tool_name") == "Bash":
-            _snapshot_heads(data, payload, cfg, git)
     elif event == "PostToolUse":
         _set_state(data, "working")
         name = str(payload.get("tool_name") or "")
