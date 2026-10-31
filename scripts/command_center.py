@@ -12,6 +12,7 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py set <id|module/id|file> <status> [--commit SHA] [--deployed TS]
                                           [--notes TEXT] [--needs-owner TEXT] [--comment] [--close] [--no-commit]
     python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]  # prompts × GitHub issues
+    python3 scripts/command_center.py audit [--module M]       # exit 1 when it finds something
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
@@ -168,7 +169,7 @@ def render_module(view: View, modules: list[dict[str, Any]], show_all: bool) -> 
     return "\n".join(out).rstrip() + "\n"
 
 
-def render_json(view: View) -> str:
+def render_json(view: View, with_prompts: bool = False) -> str:
     mods = view.modules
 
     live = pc.live_session_ids(view.sessions, view.now)
@@ -187,7 +188,11 @@ def render_json(view: View) -> str:
         "stalled": [brief(p) for m in mods for p in m["stalled"]],
         "blocked": [{**brief(p), "needs_owner": meta_str(p, "needs_owner")} for m in mods for p in m["blocked"]],
     }
-    return json.dumps(data, indent=1)
+    if with_prompts:
+        data["prompts"] = [{"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "title": p.title,
+                            "status": p.status, "effective": view.status_of(p), "legacy": bool(p.legacy),
+                            "meta": p.meta} for p in view.prompts]
+    return json.dumps(data, indent=1, default=str)
 
 
 # --- markdown: module README tables + the root board ---------------------------------------------------
@@ -381,8 +386,9 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
         print(f"--close closes the issue of a finished prompt ({', '.join(pc.CLOSED)}), not {args.status}", file=sys.stderr)
         return 2
     try:
-        pc.set_status(view.spec, p.rel, args.status, commit=args.commit, deployed=args.deployed, notes=args.notes,
-                      needs_owner=args.needs_owner)
+        clear = list(args.clear or []) + (["needs_owner"] if args.needs_owner == "" else [])
+        pc.set_status(view.spec, p.rel, args.status, clear=clear, commit=args.commit, deployed=args.deployed,
+                      notes=args.notes, needs_owner=args.needs_owner or None)
         moved = pc.place(view.spec, p.rel, args.status)[1] if view.spec.get("status_folders") else []
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
@@ -493,6 +499,44 @@ def cmd_claim(view: View, args: argparse.Namespace) -> int:
     commit_change(view, [p.module], [p.rel, *moved], f"docs(prompts): {p.module} {p.id or p.name} running ({sid[:8]}, by hand)",
                   args.no_commit)
     return 0
+
+
+def audit_findings(view: View, module: str | None = None) -> list[str]:
+    prompts = [p for p in view.prompts if not module or p.module == module]
+    out = []
+    for p in prompts:
+        raw = str(p.meta.get("status") or "pending")
+        if raw in ("on-main", "deployed", "done") and not p.meta.get("commit"):
+            out.append(f"{pi.label(p)}: {raw} with no commit ({p.rel})")
+        if p.meta.get("todo"):
+            out.append(f"{pi.label(p)}: todo: {p.meta['todo']} left over ({p.rel})")
+        folder = p.path.parent.name
+        if folder in (pc.COMPLETED_FOLDER, pc.PENDING_FOLDER) and folder != pc.status_folder(raw):
+            out.append(f"{p.name}: status {raw} but filed under {folder}/ (`command_center.py sort` moves it)")
+        if not p.id and p.status not in pc.NOT_COUNTED:
+            out.append(f"{p.name}: no id, so `set <module>/<ID>` can't reach it (add `id:` to its frontmatter)")
+    by_id: dict[tuple[str, str], list[pc.Prompt]] = {}
+    for p in prompts:
+        if p.id and p.status not in pc.NOT_COUNTED:
+            by_id.setdefault((p.module, p.id.lower()), []).append(p)
+    for (mod, _), ps in sorted(by_id.items()):
+        if len(ps) > 1:
+            out.append(f"{mod} {ps[0].id}: id doubled ({', '.join(sorted(p.name for p in ps))}); "
+                       "give one a distinct id or set it superseded")
+    root = Path(str(view.spec["repo"])) / str(view.spec["root"])
+    if root.is_dir() and not module:
+        for folder in sorted(root.iterdir()):
+            if (folder.is_dir() and not folder.is_symlink() and not folder.name.startswith("_")
+                    and folder.name == folder.name.lower() and any(folder.rglob("*.md"))):
+                out.append(f"lower-case module folder {folder.relative_to(Path(str(view.spec['repo'])))}/ "
+                           "(module folders are capitalized; move its prompts with `set` or `sort`)")
+    return out
+
+
+def cmd_audit(view: View, args: argparse.Namespace) -> int:
+    found = audit_findings(view, args.module)
+    print("\n".join(found) if found else "audit: nothing to report")
+    return 1 if found else 0
 
 
 def cmd_sort(view: View, args: argparse.Namespace) -> int:
@@ -653,6 +697,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.add_argument("--module", help="one module's prompts")
         parser.add_argument("--all", action="store_true", help="every prompt of every module, incl. skipped")
         parser.add_argument("--json", action="store_true")
+        parser.add_argument("--prompts", action="store_true", help="with --json: every prompt with its frontmatter")
         parser.add_argument("--board", action="store_true", help="regenerate the module README tables and the board")
         parser.add_argument("--html", action="store_true", help="write the HTML dashboard and print its path")
     s = sub.add_parser("set", help="set a prompt's status")
@@ -662,6 +707,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--deployed")
     s.add_argument("--notes")
     s.add_argument("--needs-owner", dest="needs_owner")
+    s.add_argument("--clear", action="append", metavar="KEY", help="remove a frontmatter key (repeatable)")
     s.add_argument("--no-commit", action="store_true")
     s.add_argument("--comment", action="store_true", help="post one progress comment (status + commit) to its issue")
     s.add_argument("--close", action="store_true", help="close its issue with that comment (done/skipped/superseded)")
@@ -669,6 +715,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     i.add_argument("--module")
     i.add_argument("--fix", action="store_true", help="write the issue: keys it can match (never creates an issue)")
     i.add_argument("--no-commit", action="store_true")
+    au = sub.add_parser("audit", help="data problems: no commit, todo left, folder vs status, ids, lower-case folders")
+    au.add_argument("--module")
     c = sub.add_parser("claim", help="attach a live session to a prompt (running + session_id; arms its Stop gate)")
     c.add_argument("ref", help="ID, module/ID or file name")
     c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
@@ -710,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_deploy_check(view, args)
     if args.cmd == "issues":
         return cmd_issues(view, args)
+    if args.cmd == "audit":
+        return cmd_audit(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))
@@ -724,7 +774,7 @@ def main(argv: list[str] | None = None) -> int:
         print(out)
         return 0
     if args.json:
-        print(render_json(view))
+        print(render_json(view, args.prompts))
         return 0
     if args.module or args.all:
         mods = [m for m in view.modules if args.all or m["module"] == args.module]

@@ -616,11 +616,16 @@ def mark_running(spec: dict[str, Any], rel: str, sid: str, live_sids: set[str]) 
     return prev if new is not None else None
 
 
-def set_status(spec: dict[str, Any], rel: str, status: str, **fields: Any) -> dict[str, Any]:
+def set_status(spec: dict[str, Any], rel: str, status: str, clear: list[str] | tuple[str, ...] = (),
+               **fields: Any) -> dict[str, Any]:
+    """Write ``status`` and the given fields (None = leave alone); ``clear`` names keys to remove."""
     if status not in STATUSES:
         raise ValueError(f"unknown status {status!r}; one of {', '.join(STATUSES)}")
+    if {"status", "updated"} & set(clear):
+        raise ValueError("--clear can't remove status or updated")
     updates: dict[str, Any] = {"status": status, "updated": _now_iso(), "todo": None}  # setting a status confirms it
     updates.update({k: v for k, v in fields.items() if v is not None})
+    updates.update({k: None for k in clear})
     spec = _spec(spec)
     path = Path(str(spec["repo"])) / rel
     with _PromptLock(_lock_dir(spec), rel):

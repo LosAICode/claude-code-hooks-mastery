@@ -194,3 +194,52 @@ def test_module_table_has_an_issue_column(center):
     table = cc.render_module_table(view, m)
     assert table.startswith("| # | Prompt | Status | Owner | Commit | Issue | Updated | Notes |")
     assert "| 9d | `Funnels-B12-4-Webinar.md` | ⚪ pending |  |  | #612 |" in table
+
+
+def test_json_prompts_lists_every_prompt_with_its_frontmatter(center, capsys):
+    assert run("--json", "--prompts") == 0
+    data = json.loads(capsys.readouterr().out)
+    rows = {r["name"]: r for r in data["prompts"]}
+    assert rows["Funnels-B11-Perf.md"]["meta"] == {"status": "deployed", "order": "7", "commit": "c4201b3d3"}
+    assert rows["Funnels-B11-Perf.md"]["status"] == "deployed" and rows["History-H7-Polish.md"]["effective"] == "stalled"
+    assert "modules" in data
+    assert run("--json") == 0
+    assert "prompts" not in json.loads(capsys.readouterr().out)
+
+
+def test_set_clear_and_empty_needs_owner_remove_the_key(center):
+    p = center / "docs/Prompts/funnels/Funnels-B8-Sec.md"
+    assert run("set", "funnels/B8", "pending", "--needs-owner", "", "--clear", "order", "--no-commit") == 0
+    m = pc.parse_frontmatter(p.read_text())[0]
+    assert "needs_owner" not in m and "order" not in m and m["status"] == "pending"
+    assert run("set", "funnels/B8", "pending", "--clear", "status", "--no-commit") == 2  # never the status
+
+
+def test_audit_flags_data_problems(center, capsys):
+    root = center / "docs/Prompts"
+    (root / "Funnels" / "Completed").mkdir(parents=True)
+    (root / "Funnels/Completed/Funnels-B2-Old.md").write_text("---\nstatus: pending\n---\n# B2: old\n")
+    (root / "funnels/Funnels-B5-Shipped.md").write_text("---\nstatus: on-main\ntodo: confirm\n---\n# B5\n")
+    (root / "funnels/Funnels-B11-Twin.md").write_text("---\nid: B11\nstatus: pending\n---\n# B11 twin\n")
+    (root / "funnels/Notes-About-Things.md").write_text("---\nmodule: funnels\nstatus: pending\n---\n# notes\n")
+    (root / "History").mkdir()
+    (root / "History/History-H9-X.md").write_text("---\nstatus: pending\n---\n# H9\n")
+    assert run("audit") == 1
+    out = capsys.readouterr().out
+    assert "funnels B5: on-main with no commit" in out
+    assert "funnels B5: todo: confirm left over" in out
+    assert "Funnels-B2-Old.md: status pending but filed under Completed/" in out
+    assert "funnels B11: id doubled (Funnels-B11-Perf.md, Funnels-B11-Twin.md)" in out
+    assert "Notes-About-Things.md: no id" in out
+    assert "lower-case module folder docs/Prompts/funnels/ (capitalized twin: History/" not in out
+    assert "lower-case module folder docs/Prompts/funnels/" in out
+
+
+def test_audit_clean_tree_exits_0(center, capsys, tmp_path):
+    root = center / "docs/Prompts"
+    for f in list((center / "docs").rglob("*.md")):
+        f.unlink()
+    (root / "Funnels").mkdir()
+    (root / "Funnels/Funnels-B1-X.md").write_text("---\nstatus: pending\n---\n# B1\n")
+    assert run("audit") == 0
+    assert "nothing to report" in capsys.readouterr().out
