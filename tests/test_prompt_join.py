@@ -116,7 +116,7 @@ def test_set_status_and_commit(proj):
     spec = cfg(proj)
     h8b = rel(proj, "History-H8b-Paid-Paths-Without-Rows.md")
     meta = pc.set_status(spec, h8b, "on-main", commit="abc1234", notes="deploy held")
-    assert meta["status"] == "on-main" and meta["commit"] == "abc1234" and meta["notes"] == "deploy held"
+    assert meta["status"] == "on-main" and meta["commits"] == ["abc1234"] and "commit" not in meta and meta["notes"] == "deploy held"
     (proj / "docs/other.md").write_text("unrelated dirty file\n")
     sha = pc.commit_prompt_files(spec, [h8b], "docs(prompts): H8b on main")
     assert sha and git(proj, "log", "-1", "--format=%s") == "docs(prompts): H8b on main"

@@ -19,9 +19,10 @@ from typing import Any
 
 KNOWN_KEYS = (
     "module", "id", "order", "title", "status", "needs_owner", "cost", "depends_on",
-    "session_id", "commit", "deployed", "updated", "notes", "todo", "issue",
+    "session_id", "commits", "commit", "deployed", "updated", "notes", "todo", "issue", "proof", "after", "run_last",
 )
 MAX_FRONTMATTER_LINES = 60
+_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
 _NEEDS_QUOTE = re.compile(r"""^[\[{"'!&*>|%@#`]|: | #|^$|^\s|\s$""")
 # Scalars a YAML reader would turn into a number, bool, null or date: a commit `0123456`, `123e4567`, `no`.
 _YAML_TYPED = re.compile(
@@ -82,6 +83,16 @@ def dump_frontmatter(meta: dict[str, Any]) -> str:
     keys = [k for k in KNOWN_KEYS if k in meta] + [k for k in meta if k not in KNOWN_KEYS]
     lines = ["---"] + [f"{k}: {_dump_value(meta[k])}".rstrip() for k in keys] + ["---"]
     return "\n".join(lines) + "\n"
+
+
+def commits_of(meta: dict[str, Any]) -> list[str]:
+    """Every sha a prompt names: its ``commits`` list, then the older single ``commit`` key (kept readable)."""
+    shas: list[str] = []
+    for key in ("commits", "commit"):
+        value = meta.get(key)
+        text = " ".join(str(v) for v in value) if isinstance(value, list) else str(value or "")
+        shas += _SHA.findall(text)
+    return list(dict.fromkeys(shas))
 
 
 def _mtime_ns(path: Path) -> int:
@@ -620,18 +631,25 @@ def set_status(spec: dict[str, Any], rel: str, status: str, clear: list[str] | t
                expect: dict[str, tuple] | None = None, **fields: Any) -> dict[str, Any]:
     """Write ``status`` and the given fields (None = leave alone); ``clear`` names keys to remove.
 
+    ``commit`` appends to the ``commits`` list (the older ``commit`` key is folded in and dropped).
     ``expect`` (as in ``write_meta``) makes the write conditional, for callers that decided on an older read.
     """
     if status not in STATUSES:
         raise ValueError(f"unknown status {status!r}; one of {', '.join(STATUSES)}")
     if {"status", "updated"} & set(clear):
         raise ValueError("--clear can't remove status or updated")
+    commit = fields.pop("commit", None)
     updates: dict[str, Any] = {"status": status, "updated": _now_iso(), "todo": None}  # setting a status confirms it
     updates.update({k: v for k, v in fields.items() if v is not None})
     updates.update({k: None for k in clear})
     spec = _spec(spec)
     path = Path(str(spec["repo"])) / rel
     with _PromptLock(_lock_dir(spec), rel):
+        if commit:
+            old, _, _ = parse_frontmatter(_read_head(path))
+            new = commits_of({"commit": commit}) or [str(commit)]
+            updates["commits"] = list(dict.fromkeys(commits_of(old) + new))
+            updates["commit"] = None
         meta = write_meta(path, updates, expect=expect)
     if meta is None:
         raise OSError(f"{rel} changed while writing (or no longer {expect}); not written")

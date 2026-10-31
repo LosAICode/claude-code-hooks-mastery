@@ -125,7 +125,7 @@ def test_set_updates_prompt_readme_board_and_commits(center, capsys):
     (center / "docs/unrelated.md").write_text("dirty\n")
     assert run("set", "B12-4", "on-main", "--commit", "abc1234", "--notes", "held for B13") == 0
     text = (center / "docs/Prompts/funnels/Funnels-B12-4-Webinar.md").read_text()
-    assert "status: on-main\n" in text and "commit: abc1234\n" in text and "notes: held for B13\n" in text
+    assert "status: on-main\n" in text and "commits: [abc1234]\n" in text and "notes: held for B13\n" in text
     assert "# B12-4: webinar honesty\n" in text
     assert "| 9d | `Funnels-B12-4-Webinar.md` | 🔵 on-main |" in (center / "docs/Prompts/funnels/Funnels-00-README.md").read_text()
     assert git(center, "log", "-1", "--format=%s") == "docs(prompts): funnels B12-4 → on-main"

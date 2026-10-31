@@ -17,8 +17,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import prompt_center as pc
+
 CHECKED = ("on-main", "deployed")
-_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 
 def glob_regex(pattern: str) -> re.Pattern[str]:
@@ -147,10 +148,7 @@ class History:
         return {"sha": full, "landed": landed, "files": [f for f in raw.split("\0") if f.strip()]}, None
 
 
-def commits_of(meta: dict[str, Any]) -> list[str]:
-    value = meta.get("commit")
-    text = " ".join(str(v) for v in value) if isinstance(value, list) else str(value or "")
-    return list(dict.fromkeys(_SHA.findall(text)))
+commits_of = pc.commits_of
 
 
 def check(prompts: list[Any], umap: dict[str, Any], history: History) -> list[dict[str, Any]]:
@@ -180,7 +178,8 @@ def check(prompts: list[Any], umap: dict[str, Any], history: History) -> list[di
                 continue
             units, merge_live = needs(got["files"], umap)
             at_merge = at_merge or merge_live
-            e["commits"].append({"sha": got["sha"][:9], "landed": got["landed"], "needs": sorted(units)})
+            e["commits"].append({"sha": got["sha"][:9], "landed": got["landed"], "needs": sorted(units),
+                                "files": got["files"]})
             for u in units:
                 need_by[u] = max(need_by.get(u, 0), got["landed"])
         if not e["commits"]:

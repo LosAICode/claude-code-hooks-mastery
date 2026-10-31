@@ -45,8 +45,10 @@ Flat `key: value` lines (YAML-compatible; lists as `[a, b]`; a value a YAML read
 |---|---|
 | `module`, `id`, `order` | folder, short id, sort key in the module table (defaults: folder, from the name, the id) |
 | `status` | `pending` ⚪ · `running` ▶ · `on-branch` ◐ (built, not landed) · `on-main` 🔵 (landed, deploy held) · `deployed` 🟡 (live, proof open) · `done` 🟢 · `blocked` 🔴 (owner) · `skipped` (refuted / do not run) · `superseded` (`notes: by …`) |
-| `needs_owner`, `cost`, `depends_on` | what the owner must decide, what the run costs, ids that must be done first |
-| `session_id`, `commit`, `deployed`, `updated`, `notes` | who claimed it, the landing commit, when it went live, last change, one line |
+| `needs_owner`, `cost`, `depends_on` | what the owner must decide (`inbox`; "answered …" closes it), what the run costs (`inbox`, `proofs` rank it: free · unknown · paid), ids that must be done first |
+| `session_id`, `commits`, `deployed`, `updated`, `notes` | who claimed it, every commit it shipped (`[sha, …]`; `set --commit` appends; the older single `commit:` is still read and folded in on the next `set`), when it went live, last change, one line |
+| `proof` | optional: what proves it live (script, probe account, cost); else `proofs` uses the first "live" bullet under `## Done when` |
+| `after`, `run_last` | optional: `[ID, …]` that must be done first besides `depends_on`; `true` = not while another prompt of the module runs or is on a branch. Without them `next` reads "Run after <ID>" / "Run last" in the body (a quoted mention is not a hint) |
 | `todo: confirm` | written by `migrate` when it could not read the old README row: check the status by hand |
 | `issue` | the prompt's GitHub issue (an int, a quoted number or a list); one issue per prompt |
 
@@ -72,8 +74,15 @@ python3 scripts/command_center.py audit [--module M]      # exit 1 when it finds
 python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts; exit 1 on a mismatch
 python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line in each module's board row
 python3 scripts/command_center.py sort [--dry-run] [--no-commit]   # file every prompt under Completed/ or Pending/
+python3 scripts/command_center.py inbox [--module M] [--json]        # every open owner ask, longest waiting first
+python3 scripts/command_center.py deploy-plan [--module M] [--json]  # guards, migrations, restart order, proofs: prints, runs nothing
+python3 scripts/command_center.py proofs [--module M] [--json]       # deployed prompts and what proves them, free first
+python3 scripts/command_center.py next [--parallel] [--json]         # pending prompts that can start now, and why the rest wait
 python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 ```
+
+The four planning commands read only (files, git, `systemctl show`): none restarts a unit, applies a migration,
+spends credits, writes a file or starts a session.
 
 `--json` lists `running`, `stalled` and `blocked` prompts with `updated`, `session_id` and `session_live`, so a check can
 age a stalled prompt or spot a blocked one whose session is gone. `other_sessions` (and a card in `--html`) holds the
@@ -94,8 +103,8 @@ prompts that need nothing from the owner come first, the others are marked `⚑ 
 `session_id`, records the claim in the session's tracker file so its Stop gate applies, and commits. It refuses a gone
 session, a prompt another live session holds, and anything past `blocked` (a prompt never moves backwards).
 
-**`deploy-check`** answers "is it live?" per unit. For each `on-main` and `deployed` prompt it reads the commits in
-`commit:`, finds where each landed on main (the first first-parent commit that contains it: a branch commit lands at
+**`deploy-check`** answers "is it live?" per unit. For each `on-main` and `deployed` prompt it reads every commit in
+`commits:` (and the older `commit:`); it is live only when all of them are. It finds where each landed on main (the first first-parent commit that contains it: a branch commit lands at
 its merge, not at its author time), lists the files that landing brought, and maps them to units with the project's
 map (`unit_map`; NeuroGenServer `scripts/deploy_units.json`, which `ops_drift.py` reads too: one map, owner decision
 10-30). A file needs the units of every rule it matches; a `live_at_merge` rule (static files) is live when it lands;
@@ -105,6 +114,45 @@ tests, scripts), **unchecked** (no commit, or a commit not on main, e.g. another
 prompt that is live to `deployed` with `deployed:` = the last needed unit's start, and commits; it never touches a
 `deployed` prompt and never moves one back. A start time is the unit's latest start, so `live since` can be later than
 the real moment. `--json` is what `ops_drift.py` reads for `drift-prompt-half-live-<module>-<id>` (half live > 24 h).
+
+**`inbox`** lists every prompt with a `needs_owner` that is not done/skipped/superseded (an ask that starts with
+"answered" is closed), longest waiting first: `module/ID`, status, how long it waited (since `updated`, else since the
+file last changed), its `cost`, the ask, and the line to paste (`run <path>` for a pending/blocked prompt;
+`deploy-plan --module M` for an on-main one; `proofs --module M` for a deployed one; the holding session for a running
+or on-branch one). It then lists, report only, Status Board clauses that say "owner" and name a prompt with no
+`needs_owner`.
+
+**`deploy-plan`** takes every `on-main` prompt and every `deployed` one that is half live or waiting (a later commit
+not live yet), runs `deploy-check`'s logic on them and prints, in order: the prompts and the units each still waits
+on; the migrations among their commits (files under `deploy.migrations`) to apply BY HAND first (a live prompt's
+migration ran at boot and is shown apart); the guards; one restart step per unit in `deploy.order` that is needed
+(a group's own command, e.g. `restart_web.sh` under the deploy lock, else `systemctl restart <unit>` per member), each
+with the guards that must hold right before it (`before:`, e.g. 0 live calls before `-voice`) and its proofs; then
+`deploy-check --apply` and the proofs owed. The project's steps live in the unit map's `deploy` block, not in code:
+
+| `deploy` key | meaning |
+|---|---|
+| `migrations`, `migrate` | the migrations folder; how to apply one by hand (printed) |
+| `guards` | `[{name, command, expect, before?}]`; no `before` = before the first restart |
+| `order` | unit or group names in restart order; a needed unit not listed goes last |
+| `restart` | `{group or unit: command, "*": "systemctl restart {unit}"}` |
+| `proof`, `ready`, `after_each` | per unit (`{unit}` filled in); `{unit: its ready-line grep}`; after every step (health ×3) |
+
+Without a `deploy` block it uses the map's own unit order and plain `systemctl restart`, with a note.
+
+**`proofs`** lists `deployed` prompts (live, proof open) with their `proof:` line, else the first top-level bullet
+under `## Done when` that says "live". Ranked by `cost` + `proof`: free ("session tokens only", "no AI credits",
+"0 credits", "NO … build") first, then unknown (no cost stated), then paid (credits, `$`, a build; the larger `$` later),
+then the longest deployed.
+
+**`next`** lists the pending prompts that can start now: every `depends_on`/`after` id done or deployed; not run-last
+while another prompt of its module runs or is on a branch; no file shared with a running/on-branch prompt (its commits'
+files and its live session's worktree changes, committed, uncommitted and untracked; the live tree itself is skipped)
+or with a prompt the list already starts; no unit shared with one. A prompt's files are the backticked repo files its
+body names (a bare file name counts when one tracked file has it; folders and globs do not). The unit map's `parallel`
+block says what sharing is no conflict: `shared_units` (units nearly every change restarts: NeuroGenServer `web`,
+`-celery`) and `ignore` (globs everyone edits or only reads: docs, `tests/known_failures.txt`). Without `--parallel`
+it lists the first startable prompt per module. Every other pending prompt is listed with why it waits.
 
 **`issues`** reads `gh issue list --state all` and lists: prompts with no issue (with the issues whose title names
 them), issues that name a prompt whose `issue:` doesn't list them, prompts named by several issues, state mismatches

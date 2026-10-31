@@ -17,6 +17,10 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line per module row
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
+    python3 scripts/command_center.py inbox [--module M] [--json]        # every open owner ask, oldest first
+    python3 scripts/command_center.py deploy-plan [--module M] [--json]  # guards, migrations, restart order, proofs (prints only)
+    python3 scripts/command_center.py proofs [--module M] [--json]       # deployed prompts and what proves them, free first
+    python3 scripts/command_center.py next [--parallel] [--json]         # pending prompts that can start now, and why not the rest
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 
 Config: the ``prompts`` block of the session tracker config (see docs/command-center.md).
@@ -71,6 +75,11 @@ def meta_str(p: pc.Prompt, key: str) -> str:
     if isinstance(v, list):
         return ", ".join(str(x) for x in v)
     return str(v or "")
+
+
+def commit_cell(p: pc.Prompt) -> str:
+    """The ``commits`` list, else the older ``commit`` text as written."""
+    return meta_str(p, "commits") or meta_str(p, "commit")
 
 
 def run_cell(runs: list[dict[str, Any]]) -> str:
@@ -197,7 +206,7 @@ def render_module(view: View, modules: list[dict[str, Any]], show_all: bool) -> 
             if status in pc.NOT_COUNTED and not show_all:
                 continue
             cells = [p.order or "", p.id or "", status, meta_str(p, "needs_owner"), run_cell(view.runs_of(p)),
-                     meta_str(p, "commit"), ", ".join(str(n) for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10],
+                     commit_cell(p), ", ".join(str(n) for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10],
                      p.title or p.name]
             out.append("  ".join(fit(c, w).ljust(w) for c, (_, w) in zip(cells, COLUMNS)).rstrip())
         out.append("")
@@ -252,7 +261,7 @@ def render_module_table(view: View, m: dict[str, Any]) -> str:
         if status in ("running", "stalled"):
             who = live[0]["sid8"] if live else str(p.meta.get("session_id") or (runs[0]["sid8"] if runs else ""))[:8]
             st += f" ({who})" if who else ""
-        commit = meta_str(p, "commit")
+        commit = commit_cell(p)
         cells = [p.order or "", f"`{p.name}`", st, meta_str(p, "needs_owner"), f"`{commit}`" if commit else "",
                  ", ".join(f"#{n}" for n in pi.issues_of(p.meta)), meta_str(p, "updated")[:10], _cell(meta_str(p, "notes") + (" · todo: confirm" if p.meta.get("todo") else ""))]
         rows.append("| " + " | ".join(cells) + " |")
@@ -389,7 +398,7 @@ def render_html(view: View) -> str:
                 f"<br><span class=muted>{e(p.name)}</span></td>"
                 f"<td class='s s-{e(status)}'>{e(pc.MARKS.get(status, ''))} {e(status)}</td>"
                 f"<td>{e(who)}</td><td>{e(meta_str(p, 'needs_owner'))}</td>"
-                f"<td><code>{e(meta_str(p, 'commit'))}</code></td><td>{e(meta_str(p, 'notes'))}</td></tr>")
+                f"<td><code>{e(commit_cell(p))}</code></td><td>{e(meta_str(p, 'notes'))}</td></tr>")
         cards.append(
             f"<section class=card><h2>{e(m['module'])} <small>{m['finished']}/{m['total']} done · {pct}%</small></h2>"
             f"<div class=progress role=progressbar aria-valuenow='{pct}' aria-valuemin=0 aria-valuemax=100><i style='width:{pct}%'></i></div>"
@@ -562,7 +571,7 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
     out = []
     for p in prompts:
         raw = str(p.meta.get("status") or "pending")
-        if raw in ("on-main", "deployed", "done") and not p.meta.get("commit"):
+        if raw in ("on-main", "deployed", "done") and not (pc.commits_of(p.meta) or p.meta.get("commit")):
             out.append(f"{pi.label(p)}: {raw} with no commit ({p.rel})")
         if p.meta.get("todo"):
             out.append(f"{pi.label(p)}: todo: {p.meta['todo']} left over ({p.rel})")
@@ -916,6 +925,183 @@ def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
     return 0
 
 
+# --- planning: inbox, deploy-plan, proofs, next (read-only) ------------------------------------------------
+
+
+ANSWERED = re.compile(r"answered\b", re.IGNORECASE)
+
+
+def paste_for(p: pc.Prompt) -> str:
+    """The line that moves an owner ask on: run it, or the plan for the deploy/proof it waits on."""
+    me = f"python3 {Path(__file__).resolve()}"
+    if p.status == "on-main":
+        return f"{me} deploy-plan --module {p.module}"
+    if p.status == "deployed":
+        return f"{me} proofs --module {p.module}"
+    if p.status in ("running", "on-branch"):
+        return f"(answer in the session running it: {str(p.meta.get('session_id') or '')[:8] or 'see the view'})"
+    return f"run {p.rel}"
+
+
+def board_owner_rows(view: View, text: str, module: str | None = None) -> list[dict[str, Any]]:
+    """Status Board clauses that say "owner" and name a prompt with no ``needs_owner`` (report only)."""
+    aliases = dict(view.spec.get("module_aliases") or {})
+    by_module: dict[str, list[pc.Prompt]] = {}
+    for p in view.prompts:
+        if p.id and not p.id.isdigit() and p.status not in pc.CLOSED and (not module or p.module == module):
+            by_module.setdefault(p.module, []).append(p)
+    out = []
+    for name, row in board_rows(text):
+        mod = row_module(name, set(by_module), aliases)
+        if mod is None:
+            continue
+        for clause in _CLAUSE.split(row):
+            if not re.search(r"\bowner\b", clause, re.IGNORECASE):
+                continue
+            for p in by_module[mod]:
+                if not owner_ask(p) and re.search(rf"(?<![\w-]){re.escape(p.id)}(?![\w-])", clause):
+                    out.append({"module": mod, "id": p.id, "status": p.status, "row": name, "clause": clause.strip()})
+    return list({(r["module"], r["id"], r["clause"]): r for r in out}.values())
+
+
+def cmd_inbox(view: View, args: argparse.Namespace) -> int:
+    asks = []
+    for p in view.prompts:
+        ask = owner_ask(p)
+        if (not ask or ANSWERED.match(ask) or p.status in pc.CLOSED or (args.module and p.module != args.module)):
+            continue
+        since = pc._parse_iso(p.meta.get("updated"))
+        if since is None:  # no updated: key yet, so since the file last changed
+            try:
+                since = p.path.stat().st_mtime
+            except OSError:
+                pass
+        asks.append({"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "status": view.status_of(p), "ask": ask,
+                     "cost": meta_str(p, "cost"), "updated": p.meta.get("updated"),
+                     "waited_s": int(view.now - since) if since else None, "paste": paste_for(p)})
+    asks.sort(key=lambda a: (-(a["waited_s"] or 0), a["rel"]))
+    board: list[dict[str, Any]] = []
+    rel = view.spec.get("status_board")
+    if rel:
+        try:
+            board = board_owner_rows(view, (Path(str(view.spec["repo"])) / str(rel)).read_text(), args.module)
+        except OSError:
+            pass
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), "asks": asks, "board": board}, indent=1, default=str))
+        return 0
+    lines = [f"Owner inbox · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(asks)} open asks, oldest first"]
+    for a in asks:
+        waited = f"waited {age(a['waited_s'])}" if a["waited_s"] is not None else "waited ?"
+        lines += ["", f"  {a['module']}/{a['id'] or a['name']}  {a['status']} · {waited}" + (f" · cost: {a['cost']}" if a["cost"] else ""),
+                  f"    asks: {a['ask']}", f"    {a['paste']}"]
+    if board:
+        lines += ["", f"Status Board clauses naming the owner for a prompt with no needs_owner ({len(board)}, report only)"]
+        lines += [f"  {b['module']} {b['id']} ({b['status']}): «{fit(b['clause'], 100)}»" for b in board]
+    print("\n".join(lines))
+    return 0
+
+
+def _plan_inputs(view: View, args: argparse.Namespace) -> tuple[list[pc.Prompt], dict[str, Any], Any] | None:
+    import prompt_deploy as pd
+
+    try:
+        umap = pd.load_map(view.spec)
+    except (OSError, ValueError) as e:
+        print(f"unit map unreadable: {e}", file=sys.stderr)
+        return None
+    if umap is None:
+        print("no unit map: set prompts.unit_map in the tracker config (see docs/command-center.md)", file=sys.stderr)
+        return None
+    prompts = [p for p in view.prompts if not args.module or p.module == args.module]
+    return prompts, umap, pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+
+
+def _proof_line(r: dict[str, Any]) -> str:
+    what = r["proof"] or "(no proof: line and no live bullet under Done when)"
+    return f"  {fit(r['module'] + ' ' + (r['id'] or r['name']), 22):<23}{r['rank']:<8}{fit(what, 110)}" + (
+        f"  · cost: {r['cost']}" if r["cost"] else "")
+
+
+def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
+    import prompt_deploy as pd
+    import prompt_plan as pp
+
+    got = _plan_inputs(view, args)
+    if got is None:
+        return 2
+    prompts, umap, history = got
+    plan = pp.deploy_plan(prompts, umap, history)
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), **plan}, indent=1, default=str))
+        return 0
+    lines = [f"Deploy plan · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(plan['prompts'])} prompts to ship "
+             "· it prints, it runs nothing"]
+    if plan["note"]:
+        lines.append(f"note: {plan['note']}")
+    lines += ["", "Prompts"]
+    for e in plan["prompts"]:
+        label = f"{e['module']} {e['id'] or e['name'].removesuffix('.md')}"
+        shas = ", ".join(c["sha"] for c in e["commits"]) or "-"
+        tail = (f"waits: {', '.join(pd.compact(e['waits'], umap))}" if e["waits"] else
+                "live: deploy-check --apply sets it deployed" if e["state"] == "live" else e["state"])
+        lines.append(f"  {fit(label, 27):<28}{e['status']:<10}{shas} · {tail}" + (f" · {e['reason']}" if e.get("reason") else ""))
+    lines += ["", "Migrations (apply BY HAND first, under the guards" + (f": {plan['migrate']}" if plan["migrate"] else "") + ")"]
+    todo = [m for m in plan["migrations"] if not m["applied_at_boot"]]
+    lines += [f"  {m['file']}  ({m['module']} {m['id']}, {m['sha']})" for m in todo] or ["  none"]
+    lines += [f"  (ran at boot, the prompt is live: {m['file']}, {m['module']} {m['id']})"
+              for m in plan["migrations"] if m["applied_at_boot"]]
+    lines += ["", "Guards (each must read as expected before the first restart)"]
+    lines += [f"  {g['name']}: {g['command']}  → expect {g.get('expect', '')}" for g in plan["guards"] if not g.get("before")] or ["  none in the map"]
+    lines += ["", "Restarts (one at a time, each proven before the next)"]
+    for i, st in enumerate(plan["steps"], 1):
+        for g in st["guards"]:
+            lines.append(f"     guard first, {g['name']}: {g['command']}  → expect {g.get('expect', '')}")
+        lines.append(f"  {i}. {st['unit']}")
+        lines += [f"       {c}" for c in st["commands"]]
+        lines += [f"       proof: {c}" for c in st["proof"]]
+    if not plan["steps"]:
+        lines.append("  none: every needed unit already runs these commits")
+    lines += ["", f"Then: python3 {Path(__file__).resolve()} deploy-check --apply, and the proofs owed:"]
+    lines += [_proof_line(r) for r in plan["proofs"]] or ["  none"]
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_proofs(view: View, args: argparse.Namespace) -> int:
+    import prompt_plan as pp
+
+    rows = pp.proofs([p for p in view.prompts if not args.module or p.module == args.module])
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), "proofs": rows}, indent=1, default=str))
+        return 0
+    print(f"Proofs owed · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(rows)} deployed prompts, free first")
+    print("\n".join(_proof_line(r) for r in rows) if rows else "  none")
+    return 0
+
+
+def cmd_next(view: View, args: argparse.Namespace) -> int:
+    import prompt_deploy as pd
+    import prompt_plan as pp
+
+    try:
+        umap = pd.load_map(view.spec)
+    except (OSError, ValueError):
+        umap = None
+    got = pp.next_prompts(view, umap, args.parallel)
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), **got}, indent=1, default=str))
+        return 0
+    lines = [f"Can start now ({len(got['start'])}" + (", in parallel)" if args.parallel else ", first per module)")]
+    lines += [f"  {fit(r['module'] + '/' + (r['id'] or r['name']), 22):<23}{r['paste']}" for r in got["start"]] or ["  none"]
+    lines += ["", f"Held back ({len(got['held'])})"]
+    lines += [f"  {fit(r['module'] + '/' + (r['id'] or r['name']), 22):<23}{r['why']}" for r in got["held"]] or ["  none"]
+    if umap is None:
+        lines += ["", "no unit map: unit overlap not checked"]
+    print("\n".join(lines))
+    return 0
+
+
 # --- main ------------------------------------------------------------------------------------------------
 
 
@@ -960,6 +1146,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     d.add_argument("--json", action="store_true")
     d.add_argument("--apply", action="store_true", help="set deployed where every needed unit restarted after landing")
     d.add_argument("--no-commit", action="store_true")
+    for name, text in (("inbox", "every open owner ask, oldest first, with its cost and the line to paste"),
+                       ("deploy-plan", "guards, migrations, restart order and proofs for what is on main (prints only)"),
+                       ("proofs", "deployed prompts and what proves them, free first")):
+        pl = sub.add_parser(name, help=text)
+        pl.add_argument("--module")
+        pl.add_argument("--json", action="store_true")
+    nx = sub.add_parser("next", help="pending prompts that can start now (deps done, no run-last, no overlap)")
+    nx.add_argument("--parallel", action="store_true", help="every startable prompt, not just the first per module")
+    nx.add_argument("--json", action="store_true")
     so = sub.add_parser("sort", help="file every prompt under its module's Completed/ or Pending/ folder")
     so.add_argument("--dry-run", action="store_true")
     so.add_argument("--no-commit", action="store_true")
@@ -990,6 +1185,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_claim(view, args)
     if args.cmd == "deploy-check":
         return cmd_deploy_check(view, args)
+    if args.cmd == "inbox":
+        return cmd_inbox(view, args)
+    if args.cmd == "deploy-plan":
+        return cmd_deploy_plan(view, args)
+    if args.cmd == "proofs":
+        return cmd_proofs(view, args)
+    if args.cmd == "next":
+        return cmd_next(view, args)
     if args.cmd == "issues":
         return cmd_issues(view, args)
     if args.cmd == "audit":
