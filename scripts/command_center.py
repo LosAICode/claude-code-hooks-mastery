@@ -445,11 +445,9 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     if tests is False:
         return 2
     progress = progress_value(p, args.progress)
-    if args.tests is None and args.no_tests is None and args.status == "on-main":
+    if args.tests is None and args.no_tests is None and args.status == "on-main" and not p.meta.get("tests"):
         print(f"warning: no --tests: {p.module} {p.id or p.name} lands on main with no test verdict "
               "(--tests <results file> or --no-tests \"<why>\"); deploy-plan lists it as not proven tested", file=sys.stderr)
-    if args.notes is None and p.meta.get("notes"):
-        print(f"notes kept: {meta_str(p, 'notes')}  (--notes replaces them)")
     try:
         clear = list(args.clear or []) + (["needs_owner"] if args.needs_owner == "" else [])
         pc.set_status(view.spec, p.rel, args.status, clear=clear, commit=args.commit, deployed=args.deployed,
@@ -458,6 +456,8 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
         return 2
+    if args.notes is None and p.meta.get("notes"):
+        print(f"notes kept: {meta_str(p, 'notes')}  (--notes replaces them)")
     if args.status in ("pending", "blocked"):
         # The session that held it lets go, or the view still shows it running (live 10-31, A12)
         for sid in {r["sid"] for r in view.runs_of(p)}:
@@ -487,6 +487,9 @@ def tests_value(p: pc.Prompt, args: argparse.Namespace) -> str | None | bool:
         return False
     path = Path(args.tests).expanduser()
     if not path.is_file():
+        if "/" in args.tests or path.suffix in (".txt", ".json"):  # a results file that isn't there is no verdict
+            print(f"--tests refused: {args.tests} is not a file", file=sys.stderr)
+            return False
         return f"{args.tests} · {sha[:9]}"
     summary, why = pp.read_verdict(path)
     if summary is None:
@@ -1201,9 +1204,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--commit")
     s.add_argument("--deployed")
     s.add_argument("--notes")
-    s.add_argument("--tests", metavar="FILE|TEXT", help="the run_tests.py results file (its SUMMARY must say OK), or a verdict")
+    verdict = s.add_mutually_exclusive_group()
+    verdict.add_argument("--tests", metavar="FILE|TEXT", help="the run_tests.py results file (its SUMMARY must say OK), or a verdict")
+    verdict.add_argument("--no-tests", dest="no_tests", metavar="WHY", help="a landing with nothing to test (docs, config)")
     s.add_argument("--tested", metavar="SHA", help="with --tests: the commit tested (default: --commit, else its last commit)")
-    s.add_argument("--no-tests", dest="no_tests", metavar="WHY", help="a landing with nothing to test (docs, config)")
     s.add_argument("--progress", metavar="N[/M] [text]", help="how far a running prompt is; M defaults to its ## Do items")
     s.add_argument("--needs-owner", dest="needs_owner")
     s.add_argument("--clear", action="append", metavar="KEY", help="remove a frontmatter key (repeatable)")

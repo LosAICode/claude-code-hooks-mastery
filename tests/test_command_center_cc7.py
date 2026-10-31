@@ -128,6 +128,8 @@ def test_set_tests_stores_summary_path_and_sha_and_refuses_a_fail(plan, capsys, 
     assert run("set", "agents/C10", "on-main", "--tests", str(bad), "--no-commit") == 2
     assert "FAIL" in capsys.readouterr().err and path.read_text() == before
     assert run("set", "agents/C11", "on-main", "--tests", str(ok), "--no-commit") == 2  # no commit: no sha to name
+    assert run("set", "agents/C10", "on-main", "--tests", str(tmp_path / "missing.txt"), "--no-commit") == 2
+    assert "not a file" in capsys.readouterr().err
     assert run("set", "agents/C11", "on-main", "--no-tests", "docs only", "--no-commit") == 0
     assert meta_of(plan / "docs/Prompts/agents/Agents-C11-X.md")["tests"] == "none: docs only"
 
@@ -135,6 +137,10 @@ def test_set_tests_stores_summary_path_and_sha_and_refuses_a_fail(plan, capsys, 
 def test_set_on_main_without_tests_warns(plan, capsys):
     assert run("set", "agents/C10", "on-main", "--no-commit") == 0
     assert "no --tests" in capsys.readouterr().err
+    assert run("set", "agents/C10", "on-main", "--no-tests", "docs only", "--no-commit") == 0
+    capsys.readouterr()
+    assert run("set", "agents/C10", "on-main", "--no-commit") == 0
+    assert "no --tests" not in capsys.readouterr().err  # it has a verdict already
 
 
 def test_deploy_plan_lists_prompts_not_proven_tested(plan, capsys, tmp_path):
