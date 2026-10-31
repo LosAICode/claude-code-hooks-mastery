@@ -70,6 +70,7 @@ python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [-
 python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]
 python3 scripts/command_center.py audit [--module M]      # exit 1 when it finds something
 python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts; exit 1 on a mismatch
+python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line in each module's board row
 python3 scripts/command_center.py sort [--dry-run] [--no-commit]   # file every prompt under Completed/ or Pending/
 python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
 ```
@@ -118,6 +119,13 @@ module, splits its State cell into clauses (at `·`, `;`, `|`, parentheses; code
 a prompt id with only HELD/ON MAIN/merged/🔵 words, while the prompt is `deployed`/`done`, is flagged, and so is one
 with only DEPLOYED/LIVE/🟢/🟡 words while the prompt is not live yet. Ranges (`H1-H6`) and bare numbers are skipped;
 "live proof/walk/check" is not a status. It prints the rows and never edits the board's prose.
+
+**`board-markers`** (owner OK 10-30) puts `<!-- prompts:<module> --><!-- /prompts -->` at the start of the State cell
+of the first board row per module. From then on every `set`, `claim`, `deploy-check --apply` and `--board` rewrites
+only the text between those markers: `**Prompts:** 🟢 9/12 done or deployed (… done, … deployed) · ▶ running … ·
+🔵 on-main … · 🔴 blocked … · ⚪ N pending (next …).` It has no time stamp, so it changes only when a status does. It is
+never written while the board has uncommitted edits (another session's lines would ride along in the pathspec commit);
+the command then says so and the next run catches up. `board-check` ignores the generated text.
 
 ## What the hooks do
 
