@@ -1,4 +1,4 @@
-"""The tracker claims a prompt on the first message and reminds the session once to set its final status."""
+"""The tracker claims a prompt from a message (the first, or a later one while it holds none) and reminds the session once to set its final status."""
 import json
 
 import pytest
@@ -60,10 +60,12 @@ def test_done_prompt_is_never_claimed(proj):
     assert s["prompt_file"] == "docs/Prompts/funnels/Funnels-B4-Done.md" and s["prompt_claimed"] is False
 
 
-def test_only_the_first_message_claims(proj):
+def test_a_later_message_claims_too(proj):
+    # CC8: a session that starts with a question or a slash command and says `run <path>` later is claimed then
     st.track("UserPromptSubmit", prompt_event("fix the tests"))
     st.track("UserPromptSubmit", prompt_event(f"Run {PROMPT}"))
-    assert meta(proj)["status"] == "pending" and st.load_session(SID).get("prompt_file") is None
+    assert meta(proj)["status"] == "running" and st.load_session(SID)["prompt_file"] == PROMPT
+    assert st.load_session(SID)["task"] == "fix the tests"
 
 
 def test_claim_survives_a_broken_prompt_module(proj, monkeypatch):

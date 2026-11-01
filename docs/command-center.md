@@ -61,13 +61,13 @@ prompt whose session is gone shows as `stalled`.
 ## Commands
 
 ```
-python3 scripts/command_center.py                 # summary per module, then Running now / Other live sessions / Stalled / Blocked on owner / Next up
+python3 scripts/command_center.py                 # summary per module, then Sessions / Stalled / Blocked on owner / Parked / Next up
 python3 scripts/command_center.py --module M      # every prompt of one module (order, id, status, owner, session, commit, updated, title)
 python3 scripts/command_center.py --all           # every module, including skipped and superseded
 python3 scripts/command_center.py --json          # for scripts (ops checks); --json --prompts adds every prompt with its frontmatter
 python3 scripts/command_center.py --board         # rewrite the status block of every module README + the root board; prints what changed
 python3 scripts/command_center.py --html          # write the HTML dashboard (prompts.html, default ~/.claude/session-tracker/command-center.html)
-python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA] [--deployed TS] [--notes TEXT] [--needs-owner TEXT]
+python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA]… [--deployed TS] [--notes TEXT] [--needs-owner TEXT] [--proof TEXT]
                                   [--tests FILE|TEXT [--tested SHA] | --no-tests WHY] [--progress N[/M] [text]]
                                   [--clear KEY]… [--comment] [--close] [--no-commit]
 python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand (running + session_id + its Stop gate)
@@ -88,15 +88,30 @@ The four planning commands read only (files, git, `systemctl show`): none restar
 spends credits, writes a file or starts a session.
 
 `--json` lists `running`, `stalled` and `blocked` prompts with `updated`, `session_id` and `session_live`, so a check can
-age a stalled prompt or spot a blocked one whose session is gone. `other_sessions` (and a card in `--html`) holds the
-live sessions "Running now" leaves out, as in the terminal view: `{prompt, session}` text, newest first.
+age a stalled prompt or spot a blocked one whose session is gone. `sessions` holds the Sessions rows (below) as
+`{sid, sid8, state, age_s, waiting_on, prompt, unclaimed, branch, worktree, last_commit, task}`, `session_counts` the
+header counts, and `parked` the Parked prompts with their `tip` and `age_s`.
+
+**Sessions** (CC8: every live session, one list). Every live session (`pc.live_session_ids`: not ended, seen in the
+last 2 h), WAITING ON YOU first (with the tool or message it waits on: `waiting_reason`, else `last_tool`), then the
+newest activity first. Each row shows its prompt (module, id, title) and that prompt's status, whatever it is
+(`running`, `on-branch`, `deployed`, …), with `progress:`, the branch (or worktree) and the last commit. A session
+with no prompt that named one (`prompt_mentioned`, or a task that resolves to a `pending`/`blocked` prompt) shows
+`unclaimed: <module>/<ID> → command_center.py claim <module>/<ID> --session <sid8>`; one with none shows `no prompt`.
+The header counts `N live · N working · N waiting on you · N idle · N without a prompt`; a module line counts a live
+session on a prompt that is not `running` (A06, on-branch, 10-31) as `N active (<sid8>, <age>)`. `--html` has the
+same card. A session is joined to a prompt by its `prompt_file`, by the prompt's `session_id`, or by a task whose
+words claim it (`run X`); a task that only mentions a prompt (`look at X`) is no run.
+
+**Parked** (report only): an `on-branch` prompt no live session holds whose `updated` (else the file's mtime) is 24 h
+old or more, with its branch tip (the last sha in `commits:`) and age. Rerun its session or `set` its real status.
 
 `set` updates the frontmatter, regenerates that module's table and the board, and commits those files with a
 pathspec (`docs(prompts): <module> <ID> → <status>`), because an uncommitted edit in a shared tree blocks any later
 merge that touches the file. Setting a prompt `pending` or `blocked` also releases it from every session that held
 it (its tracker `prompt_file` is cleared and the prompt goes into `released_prompts`), so the view stops showing it
-running; a later claim takes it back. The header counts live sessions too: "Other live sessions" lists each one that
-Running now leaves out (its prompt is on-branch, done, …, or it has none). `--no-commit` leaves the files for your own commit. `--needs-owner ""` and `--clear KEY`
+running; a later claim takes it back. `--commit` repeats append every sha (`--commit A --commit B`); `--proof
+"<text>"` writes `proof:`. `--no-commit` leaves the files for your own commit. `--needs-owner ""` and `--clear KEY`
 remove a key (never `status` or `updated`). `--comment` posts one comment to the prompt's issue (`<module> <ID>: <old> →
 <new> · commit · deployed · notes`); `--close` closes the issue with that comment and works only with `done`,
 `skipped` or `superseded`. "Next up" is the first `pending` prompt per module by `order` whose `depends_on` are all done;
@@ -129,7 +144,10 @@ or on-branch one). It then lists, report only, Status Board clauses that say "ow
 not live yet), runs `deploy-check`'s logic on them and prints, in order: the prompts and the units each still waits
 on; the migrations among their commits (files under `deploy.migrations`) to apply BY HAND first (one whose own
 commit's units all started after that commit landed ran at boot and is shown apart, even while a later commit of the
-same prompt still waits: R4, 10-31); "Not proven tested": every prompt it ships with no `tests:`, a tested sha that is
+same prompt still waits: R4, 10-31), and one at or below prod's `alembic_version` is shown apart as "already in
+prod" (the config's `prod_revision` query; read-only; any error = "alembic_version unread" and the whole list stays:
+R4b/R5 were listed 10-31 while prod was already at r5). The walk parses `revision`/`down_revision` (merge tuples too)
+in the migrations folder, never imports a file; "Not proven tested": every prompt it ships with no `tests:`, a tested sha that is
 not on main, or a commit that landed after the tested sha; the guards; one restart step per unit in `deploy.order` that is needed
 (a group's own command, e.g. `restart_web.sh` under the deploy lock, else `systemctl restart <unit>` per member), each
 with the guards that must hold right before it (`before:`, e.g. 0 live calls before `-voice`) and its proofs; then
@@ -169,7 +187,10 @@ creating them is outward-facing, so the owner OKs the list first.
 
 **`audit`** flags `on-main`/`deployed`/`done` with no commit, a `todo:` left over, a file whose `Pending/` or
 `Completed/` folder disagrees with its status, a prompt with no id (so `set <module>/<ID>` can't reach it), an id two
-live prompts share, a lower-case module folder holding prompts (module folders are capitalized), and (CC7):
+live prompts share, a lower-case module folder holding prompts (module folders are capitalized), (CC8) two module
+folders whose names differ only by case (`connections/` beside `Connections/`), every `kind: reference` file (skipped
+by `scan`: the owner's audit report is no prompt), a `Pending/` file with no `id:` and no `## Do` (add `kind:
+reference`?): all report only, it never moves or deletes the owner's files; and (CC7):
 - an `on-main`/`deployed`/`done` prompt whose `notes:` still say queued/pending/waiting/todo/blocked;
 - a `deployed` prompt with neither `proof:` nor a "live" bullet under `## Done when` (`proofs` can't say how to close it);
 - a commit on main whose subject names a prompt (`#<issue>` or `<module> <ID>`), made since that prompt's first commit,
@@ -193,13 +214,17 @@ the command then says so and the next run catches up. `board-check` ignores the 
 
 ## What the hooks do
 
-- **Claim.** On a session's first message that names a prompt file, the tracker marks that prompt `running` with the
+- **Claim.** On any message that names a prompt file while the session holds no prompt (CC8: not only the first; a
+  session that holds one is never re-pointed by a later mention), the tracker marks that prompt `running` with the
   session id (and commits it with a pathspec when `commit_claims` is on) when a claim verb (`run`, `execute`, `start`)
   is among the first six words (`analyze and execute X`, `Run plan and execute X`) or the message is only a prompt
   path (backticks allowed). A question (`why is X stalled`, first word why/what/how/did/is/…) or a negation before the
   verb (`do not run X`) never claims. Only `pending`, `blocked` and `running`-with-a-dead-session prompts can be
   claimed; a prompt never moves backwards. A first message that merely mentions a prompt ("look at X.md", "review
-  X.md") records `prompt_mentioned` and claims nothing; `claim` attaches such a session by hand. The claim costs about 60 ms once per session (113 prompts, 80 tracker files).
+  X.md") records `prompt_mentioned` and claims nothing; `claim` attaches such a session by hand. A path a terminal
+  wrapped (`…-Attach⏎  ments.md`, A04 10-31) is joined back before matching, and a token that still matches nothing but
+  is a unique prefix (≥ 20 characters) of one prompt's file name resolves to it. A claim scan costs about 60 ms (113
+  prompts, 80 tracker files), once per message only while the session holds no prompt.
 - **Commits.** Each commit a session's own command made in the prompts repo (or one of its worktrees) is appended to
   the claimed prompt's `commits:` (`pc.add_commits`: status and `updated` untouched; a prompt filed elsewhere since the
   claim is found through `_moved.json`), then committed with a pathspec as `docs(prompts): <module> <ID> commits +<sha>`
@@ -213,6 +238,11 @@ the command then says so and the next run catches up. `board-check` ignores the 
   still `running` under the session and the session committed code (not a status commit) after the prompt's `updated`
   (its claim or last `set`): it asks for `set … running --progress <done>/<total>`. The two never ask in the same stop.
   Message override: `prompts.progress_message`.
+- **Claim gate** (CC8, last). A Stop is blocked once when the session holds no claimed prompt and made a code commit
+  (not a status commit) or ran a deploy command: it asks to `claim <module>/<ID> --session <sid8>` (naming the prompt
+  it mentioned, when it did) or to write one from the template in `Documentation/Prompts/README.md` and claim that. A
+  session that only read, viewed (`/cc`, `/sessions`) or answered questions is never asked. Override:
+  `prompts.claim_message`.
 
 ## Config
 
@@ -229,6 +259,7 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `sync_lock`, `sync_every_hours` | an auto-commit daemon's lock file and cadence; `migrate` refuses to run near it |
 | `unit_map`, `main_branch` | `deploy-check`: the project's path → unit map (repo-relative JSON) and the branch it lands on (default `main`) |
 | `status_board` | `board-check`: the hand-written Status Board (repo-relative) |
+| `prod_revision` | `deploy-plan`: a read-only shell query printing prod's `alembic_version` head(s), e.g. `psql -h 127.0.0.1 -U postgres -d neurogenserver -tAc 'SELECT version_num FROM alembic_version'`; unset = "alembic_version unread" |
 
 ## Migration
 

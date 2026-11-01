@@ -121,6 +121,9 @@ def module_line(m: dict[str, Any]) -> str:
     if m["running"]:
         who = ", ".join(f"{r['sid8']}, {age(r['age_s'])}" if r else "?" for _, r in m["running"])
         parts.append(f"{len(m['running'])} running ({who})")
+    if m.get("active"):
+        who = ", ".join(f"{r['sid8']}, {age(r['age_s'])}" for _, r in m["active"])
+        parts.append(f"{len(m['active'])} active ({who})")
     if c.get("pending"):
         parts.append(f"{c['pending']} pending")
     if c.get("blocked"):
@@ -134,22 +137,90 @@ def _row(module: str, p: pc.Prompt, tail: str) -> str:
     return f"  {module:<14}{(p.id or ''):<7}{fit(p.title or p.name, 36):<36}  {tail}".rstrip()
 
 
-def other_live_sessions(view: View, listed: set[str]) -> list[tuple[str, str]]:
-    """(prompt part, session part) per live session that "Running now" leaves out, newest first: its prompt is
-    past running (on-branch, done, …) or it has none (live 10-31: 6 live sessions, 3 shown)."""
+def session_rows(view: View) -> list[dict[str, Any]]:
+    """One row per live session, WAITING ON YOU first, then newest activity first (CC8: every live session is on the
+    command center, whatever its prompt's status, or with a hint to claim one)."""
     live = pc.live_session_ids(view.sessions, view.now)
-    prompt_of = {r["sid"]: p for p in view.prompts for r in view.runs_of(p)}
+    by_rel = {p.rel: p for p in view.prompts}
+    prompt_of: dict[str, pc.Prompt] = {}
+    for p in view.prompts:
+        for r in view.runs_of(p):
+            prompt_of.setdefault(r["sid"], p)
     rows = []
-    for s in sorted(view.sessions, key=lambda s: pc._parse_iso(s.get("last_seen")) or 0, reverse=True):
+    for s in view.sessions:
         sid = str(s["session_id"])
-        if sid not in live or sid in listed:
+        if sid not in live:
             continue
-        p = prompt_of.get(sid)
-        what = (f"{p.module:<14}{(p.id or ''):<7}{fit(p.title or p.name, 36):<36}  {view.status_of(p)}" if p
-                else f"{'-':<14}{'':<7}{fit('(no prompt) ' + str(s.get('task') or ''), 36):<36}")
+        own = str(s.get("prompt_file") or "")  # its claimed prompt first, when the join kept it
+        p = by_rel[own] if any(r["sid"] == sid for r in view.runs.get(own, [])) else prompt_of.get(sid)
+        state = pc.session_display_state(s, view.now)
         seen = pc._parse_iso(s.get("last_seen")) or view.now
-        rows.append((what, f"{sid[:8]}  {pc.session_display_state(s, view.now)}  {age(max(0, view.now - seen))}"))
+        row: dict[str, Any] = {
+            "sid": sid, "sid8": sid[:8], "state": state, "age_s": max(0, int(view.now - seen)),
+            "waiting_on": (s.get("waiting_reason") or s.get("last_tool")) if state == "WAITING ON YOU" else None,
+            "prompt": None, "unclaimed": None, "branch": s.get("branch"), "worktree": s.get("worktree"),
+            "last_commit": s.get("last_commit"), "task": s.get("task")}
+        if p:
+            row["prompt"] = {"module": p.module, "id": p.id, "rel": p.rel, "title": p.title or p.name,
+                             "status": view.status_of(p), "progress": p.meta.get("progress")}
+        else:
+            rel = s.get("prompt_mentioned")
+            rel = rel if rel in by_rel else pc.resolve_prompt(str(s.get("task") or ""), view.cfg, view.prompts)
+            q = by_rel.get(rel) if rel else None
+            if q and q.status in ("pending", "blocked") and rel not in (s.get("released_prompts") or []):
+                ref = f"{q.module}/{q.id}" if q.id else q.name
+                row["unclaimed"] = {"module": q.module, "id": q.id, "rel": q.rel,
+                                    "claim": f"command_center.py claim {ref} --session {sid[:8]}"}
+        rows.append(row)
+    rows.sort(key=lambda r: r["age_s"])
+    rows.sort(key=lambda r: r["state"] != "WAITING ON YOU")
     return rows
+
+
+def session_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {"live": len(rows), "working": sum(r["state"] == "working" for r in rows),
+            "waiting": sum(r["state"] == "WAITING ON YOU" for r in rows), "idle": sum(r["state"] == "idle" for r in rows),
+            "no_prompt": sum(r["prompt"] is None for r in rows)}
+
+
+def session_what(r: dict[str, Any]) -> str:
+    """The prompt part of a Sessions row: the prompt and its status, the claim to paste, or ``no prompt``."""
+    p, u = r["prompt"], r["unclaimed"]
+    if p:
+        tail = f" {p['progress']}" if p.get("progress") else ""
+        return f"{p['module']} {p['id'] or p['rel'].rsplit('/', 1)[-1]} {fit(p['title'], 36)} · {p['status']}{tail}"
+    if u:
+        ref = f"{u['module']}/{u['id']}" if u["id"] else u["rel"].rsplit("/", 1)[-1]
+        return f"unclaimed: {ref} → {u['claim']}"
+    return "no prompt" + (f" · {fit(str(r['task']), 40)}" if r.get("task") else "")
+
+
+def session_line(r: dict[str, Any]) -> str:
+    where = r.get("branch") or os.path.basename(str(r.get("worktree") or "")) or ""
+    extras = [f"waits on: {r['waiting_on']}" if r.get("waiting_on") else "", f"@{where}" if where else "",
+              f"last {r['last_commit']}" if r.get("last_commit") else ""]
+    return f"  {r['sid8']}  {r['state']} {age(r['age_s'])}  {session_what(r)}" + "".join(f" · {x}" for x in extras if x)
+
+
+PARKED_AFTER_S = 24 * 3600
+
+
+def parked(view: View) -> list[tuple[str, pc.Prompt, str, int]]:
+    """(module, prompt, branch tip, age) per on-branch prompt no live session holds, unmoved for 24 h (report only)."""
+    out = []
+    for m in view.modules:
+        for p, status in m["prompts"]:
+            if status != "on-branch" or any(r.get("live") for r in view.runs_of(p)):
+                continue
+            since = pc._parse_iso(p.meta.get("updated"))
+            if since is None:
+                try:
+                    since = p.path.stat().st_mtime
+                except OSError:
+                    continue
+            if view.now - since >= PARKED_AFTER_S:
+                out.append((m["module"], p, (pc.commits_of(p.meta) or ["-"])[-1], int(view.now - since)))
+    return sorted(out, key=lambda x: -x[3])
 
 
 def render_terminal(view: View) -> str:
@@ -157,20 +228,23 @@ def render_terminal(view: View) -> str:
     running = sum(len(m["running"]) for m in mods)
     stalled = sum(len(m["stalled"]) for m in mods)
     blocked = sum(len(m["blocked"]) for m in mods)
-    listed = {r["sid"] for m in mods for _, r in m["running"] if r}
-    others = other_live_sessions(view, listed)
+    rows = session_rows(view)
+    n = session_counts(rows)
     stamp = datetime.fromtimestamp(view.now).strftime("%Y-%m-%d %H:%M")
     lines = [f"Prompt command center · {stamp} · {running} running · {stalled} stalled · {blocked} blocked on owner"
-             f" · {len(listed) + len(others)} live sessions", ""]
+             f" · {n['live']} live · {n['working']} working · {n['waiting']} waiting on you · {n['idle']} idle"
+             f" · {n['no_prompt']} without a prompt", ""]
     lines += [module_line(m) for m in mods]
     if not mods:
         lines.append("(no prompts found; check the prompts block of the tracker config)")
+    if rows:
+        lines += ["", "Sessions"] + [session_line(r) for r in rows]
     sections = [
-        ("Running now", [(m["module"], p, (f"{r['sid8']}  {r['state']}  {age(r['age_s'])}" + (f"  @{r['branch']}" if r.get("branch") else "")
-                          if r else "?") + progress_tail(p)) for m in mods for p, r in m["running"]]),
         ("Stalled (frontmatter says running, session gone)",
          [(m["module"], p, _last_run(view.runs_of(p), p)) for m in mods for p in m["stalled"]]),
         ("Blocked on owner", [(m["module"], p, meta_str(p, "needs_owner") or meta_str(p, "notes")) for m in mods for p in m["blocked"]]),
+        ("Parked (on-branch, no live session, unmoved 24 h+)",
+         [(mod, p, f"tip {tip} · {age(secs)}") for mod, p, tip, secs in parked(view)]),
         ("Next up", [(m["module"], m["next"], f"⚑ needs owner: {owner}" if owner else "")
                      for m, owner in sorted(((m, owner_ask(m["next"])) for m in mods if m["next"]),
                                             key=lambda mo: bool(mo[1]))]),
@@ -178,9 +252,6 @@ def render_terminal(view: View) -> str:
     for title, rows in sections:
         if rows:
             lines += ["", title] + [_row(mod, p, tail) for mod, p, tail in rows]
-        if title == "Running now" and others:
-            lines += ["", "Other live sessions (prompt past running, or none)"]
-            lines += [f"  {what}  {who}".rstrip() for what, who in others]
     return "\n".join(lines)
 
 
@@ -232,9 +303,10 @@ def render_json(view: View, with_prompts: bool = False) -> str:
                      "age_s": r["age_s"] if r else None} for m in mods for p, r in m["running"]],
         "stalled": [brief(p) for m in mods for p in m["stalled"]],
         "blocked": [{**brief(p), "needs_owner": meta_str(p, "needs_owner")} for m in mods for p in m["blocked"]],
-        "other_sessions": [{"prompt": " ".join(what.split()), "session": " ".join(who.split())}
-                           for what, who in other_live_sessions(view, {r["sid"] for m in mods for _, r in m["running"] if r})],
+        "sessions": session_rows(view),
+        "parked": [{**brief(p), "tip": tip, "age_s": secs} for _, p, tip, secs in parked(view)],
     }
+    data["session_counts"] = session_counts(data["sessions"])
     if with_prompts:
         data["prompts"] = [{"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "title": p.title,
                             "status": p.status, "effective": view.status_of(p), "legacy": bool(p.legacy),
@@ -381,12 +453,21 @@ def render_html(view: View) -> str:
     blocked = [(m["module"], p) for m in view.modules for p in m["blocked"]]
     chips = [f"<span class=chip>▶ {len(running)} running</span>", f"<span class=chip>⚠ {len(stalled)} stalled</span>",
              f"<span class=chip>🔴 {len(blocked)} blocked on owner</span>"]
-    others = other_live_sessions(view, {r["sid"] for _, _, r in running if r})
+    rows = session_rows(view)
+    n = session_counts(rows)
+    chips.append(f"<span class=chip>{n['live']} live · {n['waiting']} waiting on you · {n['no_prompt']} without a prompt</span>")
     cards = []
-    if others:
-        cards.append("<section class=card><h2>Other live sessions <small>prompt past running, or none</small></h2><table>"
-                     + "".join(f"<tr><td>{e(' '.join(what.split()))}</td><td><code>{e(' '.join(who.split()))}</code></td></tr>"
-                               for what, who in others) + "</table></section>")
+    if rows:
+        cards.append("<section class=card><h2>Sessions <small>waiting on you first</small></h2><table>"
+                     + "".join(f"<tr><td><code>{e(r['sid8'])}</code></td><td>{e(r['state'])} {e(age(r['age_s']))}</td>"
+                               f"<td>{e(session_what(r))}</td><td>{e(r.get('waiting_on') or '')}</td>"
+                               f"<td>{e(r.get('branch') or '')}</td><td><code>{e(r.get('last_commit') or '')}</code></td></tr>"
+                               for r in rows) + "</table></section>")
+    held = parked(view)
+    if held:
+        cards.append("<section class=card><h2>Parked <small>on-branch, no live session, unmoved 24 h+</small></h2><table>"
+                     + "".join(f"<tr><td>{e(mod)} <b>{e(p.id or '')}</b> {e(p.title or p.name)}</td><td><code>{e(tip)}</code></td>"
+                               f"<td>{e(age(secs))}</td></tr>" for mod, p, tip, secs in held) + "</table></section>")
     for m in view.modules:
         pct = int(round(100 * m["finished"] / m["total"])) if m["total"] else 0
         rows = []
@@ -451,7 +532,8 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     try:
         clear = list(args.clear or []) + (["needs_owner"] if args.needs_owner == "" else [])
         pc.set_status(view.spec, p.rel, args.status, clear=clear, commit=args.commit, deployed=args.deployed,
-                      notes=args.notes, needs_owner=args.needs_owner or None, tests=tests, progress=progress)
+                      notes=args.notes, needs_owner=args.needs_owner or None, tests=tests, progress=progress,
+                      proof=args.proof)
         moved = pc.place(view.spec, p.rel, args.status)[1] if view.spec.get("status_folders") else []
     except (ValueError, OSError) as e:
         print(e, file=sys.stderr)
@@ -481,7 +563,7 @@ def tests_value(p: pc.Prompt, args: argparse.Namespace) -> str | None | bool:
         return f"none: {args.no_tests}"
     if args.tests is None:
         return None
-    sha = args.tested or args.commit or (pc.commits_of(p.meta) or [None])[-1]
+    sha = args.tested or (args.commit or [None])[-1] or (pc.commits_of(p.meta) or [None])[-1]
     if not sha:
         print(f"--tests: {p.module} {p.id or p.name} names no commit; pass --tested <sha> (or --commit)", file=sys.stderr)
         return False
@@ -522,7 +604,7 @@ def post_progress(view: View, p: pc.Prompt, args: argparse.Namespace) -> int:
         print(f"{pi.label(p)} has no issue in its frontmatter; nothing posted (`issues` lists its candidates)")
         return 0
     body = " · ".join([f"{pi.label(p)}: {p.status} → {args.status}"] + [x for x in (
-        f"commit `{args.commit}`" if args.commit else "", f"deployed {args.deployed}" if args.deployed else "",
+        f"commit `{', '.join(args.commit)}`" if args.commit else "", f"deployed {args.deployed}" if args.deployed else "",
         args.notes or "") if x])
     verb = ("close", "--comment") if args.close else ("comment", "--body")
     try:
@@ -638,7 +720,11 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
         folder = p.path.parent.name
         if folder in (pc.COMPLETED_FOLDER, pc.PENDING_FOLDER) and folder != pc.status_folder(raw):
             out.append(f"{p.name}: status {raw} but filed under {folder}/ (`command_center.py sort` moves it)")
-        if not p.id and p.status not in pc.NOT_COUNTED:
+        if (folder == pc.PENDING_FOLDER and "id" not in p.meta and p.status not in pc.NOT_COUNTED
+                and not re.search(r"^##\s+Do\b", pp.body_of(p), re.MULTILINE)):
+            out.append(f"{p.name}: no id and no ## Do: a reference file? add `kind: reference` to its frontmatter "
+                       f"(the owner's file: report, don't move it) ({p.rel})")
+        elif not p.id and p.status not in pc.NOT_COUNTED:
             out.append(f"{p.name}: no id, so `set <module>/<ID>` can't reach it (add `id:` to its frontmatter)")
         stale = STALE_NOTES.search(meta_str(p, "notes"))
         if raw in ("on-main", "deployed", "done") and stale:
@@ -667,8 +753,20 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
         if len(ps) > 1:
             out.append(f"{mod} {ps[0].id}: id doubled ({', '.join(sorted(p.name for p in ps))}); "
                        "give one a distinct id or set it superseded")
+    refs: list[str] = []
+    pc.scan(view.cfg, references=refs)
+    out += [f"reference: {rel} (kind: reference, not a prompt)" for rel in refs
+            if not module or f"/{module}/" in f"/{rel.lower()}"]
     root = Path(str(view.spec["repo"])) / str(view.spec["root"])
     if root.is_dir() and not module:
+        twins: dict[str, list[str]] = {}
+        for folder in sorted(root.iterdir()):
+            if folder.is_dir() and not folder.is_symlink() and not folder.name.startswith("_") and any(folder.rglob("*.md")):
+                twins.setdefault(folder.name.lower(), []).append(str(folder.relative_to(Path(str(view.spec["repo"])))) + "/")
+        for names in twins.values():
+            if len(names) > 1:
+                out.append(f"{' and '.join(sorted(names, reverse=True))} differ only by case (one module, two folders; "
+                           "report only: the owner's files stay where they are)")
         for folder in sorted(root.iterdir()):
             if (folder.is_dir() and not folder.is_symlink() and not folder.name.startswith("_")
                     and folder.name == folder.name.lower() and any(folder.rglob("*.md"))):
@@ -1110,9 +1208,12 @@ def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
     if got is None:
         return 2
     prompts, umap, history = got
-    plan = pp.deploy_plan(prompts, umap, history)
+    query = view.spec.get("prod_revision")
+    prod = pp.prod_revision(query)
+    plan = pp.deploy_plan(prompts, umap, history, prod=prod, repo=str(view.spec["repo"]))
+    head = ", ".join(prod or [])
     if args.json:
-        print(json.dumps({"now": _iso(view.now), **plan}, indent=1, default=str))
+        print(json.dumps({"now": _iso(view.now), "prod_revision": head or None, **plan}, indent=1, default=str))
         return 0
     lines = [f"Deploy plan · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(plan['prompts'])} prompts to ship "
              "· it prints, it runs nothing"]
@@ -1126,8 +1227,14 @@ def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
                 "live: deploy-check --apply sets it deployed" if e["state"] == "live" else e["state"])
         lines.append(f"  {fit(label, 27):<28}{e['status']:<10}{shas} · {tail}" + (f" · {e['reason']}" if e.get("reason") else ""))
     lines += ["", "Migrations (apply BY HAND first, under the guards" + (f": {plan['migrate']}" if plan["migrate"] else "") + ")"]
-    todo = [m for m in plan["migrations"] if not m["applied_at_boot"]]
+    if plan["migrations"] and not prod:
+        lines.append("  (alembic_version unread: " + ("its query failed" if query else "no `prod_revision` query in the "
+                     "tracker config") + "; every migration that ships is listed)")
+    todo = [m for m in plan["migrations"] if not m["applied_at_boot"] and not m["in_prod"]]
     lines += [f"  {m['file']}  ({m['module']} {m['id']}, {m['sha']})" for m in todo] or ["  none"]
+    have = [m["file"] for m in plan["migrations"] if m["in_prod"] and not m["applied_at_boot"]]
+    if have:
+        lines.append(f"  (already in prod (alembic_version {head}): {', '.join(have)})")
     lines += [f"  (ran at boot, its units started after it landed: {m['file']}, {m['module']} {m['id']})"
               for m in plan["migrations"] if m["applied_at_boot"]]
     lines += ["", "Not proven tested (no passing verdict for what ships; `set … --tests <results file>`)"]
@@ -1201,8 +1308,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s = sub.add_parser("set", help="set a prompt's status")
     s.add_argument("ref", help="ID, module/ID or file name")
     s.add_argument("status", choices=pc.STATUSES)
-    s.add_argument("--commit")
+    s.add_argument("--commit", action="append", help="a sha (repeatable: every one is appended)")
     s.add_argument("--deployed")
+    s.add_argument("--proof", help="what proves it live (writes `proof:`)")
     s.add_argument("--notes")
     verdict = s.add_mutually_exclusive_group()
     verdict.add_argument("--tests", metavar="FILE|TEXT", help="the run_tests.py results file (its SUMMARY must say OK), or a verdict")

@@ -510,6 +510,7 @@ def apply_event(
     elif event == "UserPromptSubmit":
         if not data.get("task"):
             data["task"] = task_from_prompt(str(payload.get("prompt") or ""))
+        if not data.get("prompt_file"):  # any message claims while the session holds none (CC8), never re-points
             try:
                 _claim_prompt(data, str(payload.get("prompt") or ""), cfg)
             except Exception as e:
@@ -536,9 +537,9 @@ def apply_event(
 
 
 def _claim_prompt(data: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> None:
-    """First message names a prompt file: remember it; if it says to run it, mark the prompt `running`."""
+    """A message names a prompt file: remember it; if it says to run it, mark the prompt `running`."""
     spec = cfg.get("prompts")
-    if not isinstance(spec, dict) or not spec.get("repo") or ".md" not in prompt:
+    if not isinstance(spec, dict) or not spec.get("repo") or (".md" not in prompt and "/" not in prompt):
         return
     import importlib
 
@@ -722,8 +723,35 @@ def progress_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None
         prompt=rel, ref=os.path.basename(rel).replace(" ", "\\ "), script=script, total=total)
 
 
-# progress_gate runs before prompt_gate: it asks only after the status gate's one block, never in the same stop
-GATES = (("board_gate", gate_reason), ("progress_gate", progress_gate_reason), ("prompt_gate", prompt_gate_reason))
+DEFAULT_CLAIM_REASON = (
+    "This session committed code or ran a deploy, but holds no prompt, so the command center can't track it. Claim "
+    "its prompt: `python3 {script} claim {ref} --session {sid8}`, or write one from the template in "
+    "`Documentation/Prompts/README.md` (§ New prompt) and claim that."
+)
+
+
+def claim_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None, cfg: dict[str, Any]) -> str | None:
+    """Ask once for a claim when a session with no claimed prompt made a code commit or ran a deploy (CC8: every
+    session belongs on the command center). Reading, viewing (`/cc`) and answering never ask."""
+    spec = cfg.get("prompts")
+    if not isinstance(spec, dict) or not spec.get("gate") or not session or payload.get("stop_hook_active"):
+        return None
+    if session.get("claim_gate_blocked") or session.get("prompt_claimed"):
+        return None
+    code = [c for c in session.get("commits") or [] if not _is_status_commit(c.get("subject") or "")]
+    if not code and not session.get("deploys"):
+        return None
+    named = session.get("prompt_file") or session.get("prompt_mentioned")
+    script = Path(__file__).resolve().parents[3] / "scripts" / "command_center.py"
+    return str(spec.get("claim_message") or DEFAULT_CLAIM_REASON).format(
+        script=script, ref=os.path.basename(str(named)).replace(" ", "\\ ") if named else "<module>/<ID>",
+        sid8=str(session.get("session_id"))[:8])
+
+
+# progress_gate runs before prompt_gate: it asks only after the status gate's one block, never in the same stop;
+# claim_gate last: it asks only a session the other two leave alone (no claimed prompt)
+GATES = (("board_gate", gate_reason), ("progress_gate", progress_gate_reason), ("prompt_gate", prompt_gate_reason),
+         ("claim_gate", claim_gate_reason))
 
 
 def sync_session_log(cfg: dict[str, Any]) -> bool:

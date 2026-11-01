@@ -1,6 +1,7 @@
 """deploy-plan, proofs and next: what to do next, read from the prompts, the tracker, git and the unit map.
 
-Read-only: it reads files, git and (through ``prompt_deploy``) ``systemctl show``; it never restarts a unit,
+Read-only: it reads files, git, (through ``prompt_deploy``) ``systemctl show`` and the config's read-only
+``prod_revision`` query (``alembic_version``); it never restarts a unit,
 applies a migration, writes a file or starts a session. The project's own deploy steps (guards, restart commands,
 proofs, the migrations folder) come from the ``deploy`` block of the unit map, never from this code.
 """
@@ -105,8 +106,64 @@ def proofs(prompts: list[pc.Prompt]) -> list[dict[str, Any]]:
 # --- deploy-plan -----------------------------------------------------------------------------------------
 
 
-def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.History) -> dict[str, Any]:
-    """Prompts to ship (on-main, or deployed with a commit not live yet), their units, migrations, guards, steps."""
+_REVISION = re.compile(r"^revision\s*(?::[^=\n]*)?=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
+_DOWN = re.compile(r"^down_revision\s*(?::[^=\n]*)?=\s*(.+)$", re.MULTILINE)
+_QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
+
+
+def revision_of(text: str) -> tuple[str | None, list[str]]:
+    """(revision, down_revisions) of an Alembic file, parsed (never imported); a merge has several downs."""
+    rev, down = _REVISION.search(text or ""), _DOWN.search(text or "")
+    return (rev.group(1) if rev else None), (_QUOTED.findall(down.group(1)) if down else [])
+
+
+def applied_revisions(files: dict[str, str], heads: str | list[str]) -> set[str]:
+    """Every revision at or below the heads (``alembic_version``), walking ``down_revision`` through ``files``
+    ({name: text}). A head no file defines: nothing (the walk can't vouch for anything)."""
+    graph = {}
+    for text in files.values():
+        rev, downs = revision_of(text)
+        if rev:
+            graph[rev] = downs
+    todo = [h for h in ([heads] if isinstance(heads, str) else heads) if h in graph]
+    seen: set[str] = set()
+    while todo:
+        rev = todo.pop()
+        if rev not in seen:
+            seen.add(rev)
+            todo += [d for d in graph.get(rev, []) if d in graph]
+    return seen
+
+
+def prod_revision(command: str | None, run: Any = subprocess.run) -> list[str] | None:
+    """The heads ``alembic_version`` holds now, from the config's read-only query; None when unset or it fails."""
+    if not command:
+        return None
+    try:
+        p = run(command, shell=True, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    heads = [line.strip() for line in (p.stdout or "").splitlines() if line.strip()]
+    return heads if p.returncode == 0 and heads else None
+
+
+def migration_files(repo: str | Path, mig_dir: str) -> dict[str, str]:
+    folder = Path(repo) / mig_dir
+    out = {}
+    for f in sorted(folder.glob("*.py")) if folder.is_dir() else []:
+        try:
+            out[str(f.relative_to(repo))] = f.read_text(errors="replace")
+        except OSError:
+            pass
+    return out
+
+
+def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.History,
+                prod: list[str] | None = None, repo: str | Path | None = None) -> dict[str, Any]:
+    """Prompts to ship (on-main, or deployed with a commit not live yet), their units, migrations, guards, steps.
+
+    ``prod``: the heads ``alembic_version`` holds; a migration at or below them is marked ``in_prod`` (live 10-31:
+    the R4b/R5 migrations were listed to apply by hand while prod was already at r5)."""
     results = pd.check(prompts, umap, history)
     picked = sorted((e for e in results if e["status"] == "on-main" or e["state"] in ("half", "waiting")),
                     key=lambda e: e["rel"])
@@ -119,7 +176,10 @@ def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.Hist
     def booted(e: dict[str, Any], c: dict[str, Any]) -> bool:
         return e["state"] == "live" or bool(c["needs"]) and all((e["starts"].get(u) or 0) >= c["landed"] for u in c["needs"])
 
-    migrations = [{"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f, "applied_at_boot": booted(e, c)}
+    files = migration_files(repo, mig_dir) if prod and repo and mig_dir else {}
+    applied = applied_revisions(files, prod) if files else set()
+    migrations = [{"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f, "applied_at_boot": booted(e, c),
+                   "in_prod": revision_of(files.get(f, ""))[0] in applied if applied else False}
                   for e in picked for c in e["commits"] for f in c.get("files") or []
                   if mig_dir and f.startswith(mig_dir + "/")]
     restart, ready = dep.get("restart") or {}, dep.get("ready") or {}

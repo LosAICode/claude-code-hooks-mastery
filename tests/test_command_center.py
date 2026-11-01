@@ -48,7 +48,7 @@ def test_terminal_summary(center, capsys):
     assert out.startswith("Prompt command center · 2026-10-30 16:00 · 2 running · 1 stalled · 1 blocked on owner")
     assert "funnels       1/5 done · 1 on main (held) · 1 running (d60450f0, 5m) · 1 pending · 1 blocked" in out
     assert "history       0/2 done · 1 running (c5588aac, 41m) · 1 stalled" in out
-    assert "Running now" in out and "B4" in out and "d60450f0  working" in out
+    assert "\nSessions\n" in out and "B4" in out and "d60450f0  working" in out
     assert "Stalled" in out and "H7" in out and "gone0000" in out
     assert "Blocked on owner" in out and "B8" in out and "PSL = owner" in out
     assert "Next up" in out and "B12-4" in out
@@ -379,19 +379,20 @@ def test_every_live_session_is_listed_even_when_its_prompt_is_past_running(cente
     ])
     assert run() == 0
     out = capsys.readouterr().out
-    assert out.splitlines()[0].endswith("· 1 blocked on owner · 4 live sessions")
-    other = out.split("Other live sessions", 1)[1].split("\n\n", 1)[0]
-    assert "B11" in other and "e1e1e1e1  working" in other and "deployed" in other
-    assert "f2f2f2f2  WAITING ON YOU" in other and "(no prompt) look at the logs" in other
-    assert "d60450f0" not in other and "c5588aac" not in other, "Running now already lists these"
+    assert out.splitlines()[0].endswith("· 1 blocked on owner · 4 live · 2 working · 2 waiting on you · 0 idle"
+                                        " · 1 without a prompt")
+    rows = out.split("\nSessions\n", 1)[1].split("\n\n", 1)[0]
+    assert "e1e1e1e1  working" in rows and "B11" in rows and "deployed" in rows
+    assert "f2f2f2f2  WAITING ON YOU" in rows and "no prompt · look at the logs" in rows
+    assert "d60450f0" in rows and "c5588aac" in rows, "one list: running prompts' sessions too"
     assert "ended000" not in out
     assert run("--json") == 0
-    others = json.loads(capsys.readouterr().out)["other_sessions"]
-    assert [o["session"].split()[0] for o in others] == ["f2f2f2f2", "e1e1e1e1"]  # newest first
-    assert "(no prompt) look at the logs" in others[0]["prompt"]
+    rows = json.loads(capsys.readouterr().out)["sessions"]
+    assert [r["sid8"] for r in rows] == ["f2f2f2f2", "c5588aac", "e1e1e1e1", "d60450f0"]  # waiting first, then newest
+    assert rows[0]["prompt"] is None and rows[2]["prompt"]["id"] == "B11"
     assert run("--html") == 0
     page = Path(capsys.readouterr().out.strip().splitlines()[-1]).read_text()
-    assert "Other live sessions" in page and "f2f2f2f2" in page and "ended000" not in page
+    assert "Sessions" in page and "f2f2f2f2" in page and "ended000" not in page
 
 
 def test_set_pending_or_blocked_releases_the_sessions_hold_on_the_prompt(center, capsys):

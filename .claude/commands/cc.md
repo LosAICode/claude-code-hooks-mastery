@@ -4,4 +4,4 @@ allowed-tools: Bash(python3 /opt/claude-code-hooks-mastery/scripts/command_cente
 ---
 
 Run `python3 /opt/claude-code-hooks-mastery/scripts/command_center.py $ARGUMENTS` and show its output as is, in a
-code block. Then, in one line, name anything listed under "Stalled" or "Blocked on owner" (if any). Do nothing else.
+code block. Then, in one line, name anything listed under "Stalled", "Blocked on owner" or WAITING ON YOU in Sessions (if any). Do nothing else.

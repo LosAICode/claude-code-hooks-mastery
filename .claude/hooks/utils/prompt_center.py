@@ -270,11 +270,12 @@ def _twin_key(name: str) -> str:
     return _DATE_SUFFIX.sub("", stem).strip(" -")
 
 
-def scan(cfg: dict[str, Any]) -> list[Prompt]:
+def scan(cfg: dict[str, Any], references: list[str] | None = None) -> list[Prompt]:
     """Every prompt under the root's module folders (one level of sub-folders too) plus the legacy globs.
 
     The same prompt saved twice (a legacy copy, a `Funnels/` twin of `funnels/`, a `-10-28` dated copy) counts once:
     the copy with frontmatter wins, then a root copy over a legacy one, then the lower-case folder, then the shallower.
+    A file with ``kind: reference`` (the owner's audit report) is no prompt: skipped, its path added to ``references``.
     """
     spec = prompts_cfg(cfg)
     if not spec:
@@ -291,6 +292,10 @@ def scan(cfg: dict[str, Any]) -> list[Prompt]:
         try:
             prompt = load_prompt(path, str(path.relative_to(repo)), module, legacy, aliases)
         except OSError:
+            return
+        if str(prompt.meta.get("kind") or "").lower() == "reference":
+            if references is not None:
+                references.append(prompt.rel)
             return
         folder = top or path.parent.name
         rank = (prompt.has_frontmatter, not legacy, folder == folder.lower(), -depth)
@@ -413,11 +418,44 @@ def moved_map(spec: dict[str, Any]) -> dict[str, str]:
         return {}
 
 
+_WRAP = re.compile(r"(?<=[\w./-])\n[ \t]*(?=[\w.-]*\.md\b)")
+_PREFIX_TOKEN = re.compile(r"[\w.~/-]*/[\w.-]+|[\w-]+\.md\b")
+PREFIX_MIN = 20
+
+
+def unwrap(text: str) -> str:
+    """A path a terminal wrapped (``…-Attach⏎  ments.md``, session 33a7199c, 10-31) joined back into one token."""
+    return _WRAP.sub("", text or "")
+
+
 def resolve_prompt(text: str, cfg: dict[str, Any], index: list[Prompt]) -> str | None:
-    """The repo-relative path of the prompt a message names: a path token, a moved old path, or a bare file name."""
+    """The repo-relative path of the prompt a message names: a path token, a moved old path, or a bare file name.
+
+    Failing that, the same with a wrapped path joined back, then a token that is a unique prefix (≥ 20 characters)
+    of one prompt's file name."""
     spec = prompts_cfg(cfg)
     if not spec or not text:
         return None
+    found = _resolve_exact(text, spec, index)
+    joined = unwrap(text)
+    if found:
+        return found
+    if joined != text:
+        found = _resolve_exact(joined, spec, index)
+        if found:
+            return found
+    stems = {re.sub(r"\.md$", "", p.name, flags=re.IGNORECASE): p.rel for p in index}
+    for m in _PREFIX_TOKEN.finditer(joined):
+        token = re.sub(r"\.md$", "", os.path.basename(m.group(0)), flags=re.IGNORECASE)
+        if len(token) < PREFIX_MIN:
+            continue
+        hits = {rel for stem, rel in stems.items() if stem.startswith(token)}
+        if len(hits) == 1:
+            return hits.pop()
+    return None
+
+
+def _resolve_exact(text: str, spec: dict[str, Any], index: list[Prompt]) -> str | None:
     repo = os.path.normpath(str(spec["repo"]))
     by_rel = {p.rel: p for p in index}
     by_name = {p.name: p for p in index}
@@ -455,7 +493,7 @@ def claims_prompt(text: str, verbs: list[str]) -> bool:
     A claim verb (``run``, ``execute``, …) among the first six words, or a message that is only a prompt path
     (backticks allowed). A question (``why is X stalled``) or a negation before the verb never claims.
     """
-    head = (text or "").strip()[:400]
+    head = unwrap((text or "").strip()[:400])
     if not head or head.startswith("<"):
         return False
     if _BARE_PATH.fullmatch(head):
@@ -519,8 +557,11 @@ def live_session_ids(sessions: list[dict[str, Any]], now: float, stale_after: fl
 
 def join(prompts: list[Prompt], sessions: list[dict[str, Any]], cfg: dict[str, Any], now: float,
          stale_after: float = STALE_AFTER_S) -> dict[str, list[dict[str, Any]]]:
-    """{prompt rel: [run, …]} newest first. A session matches by ``prompt_file``, else by its ``task`` text."""
+    """{prompt rel: [run, …]} newest first. A session matches by ``prompt_file``, else by a ``task`` that says to run
+    its prompt (a mention, ``look at X``, is no run: the view shows it unclaimed, CC8)."""
     runs: dict[str, list[dict[str, Any]]] = {}
+    spec = prompts_cfg(cfg) or {}
+    verbs = list(spec.get("claim_verbs") or ["run", "execute", "start"])
     by_rel = {p.rel for p in prompts}
     by_sid = {str(p.meta.get("session_id")): p.rel for p in prompts if p.status == "running" and p.meta.get("session_id")}
 
@@ -534,7 +575,8 @@ def join(prompts: list[Prompt], sessions: list[dict[str, Any]], cfg: dict[str, A
         sid = str(s["session_id"])
         rel = s.get("prompt_file")
         if not rel or rel not in by_rel:
-            rel = resolve_prompt(str(s.get("task") or ""), cfg, prompts)
+            task = str(s.get("task") or "")
+            rel = resolve_prompt(task, cfg, prompts) if claims_prompt(task, verbs) else None
         if rel and rel not in (s.get("released_prompts") or []):  # set back to pending/blocked by hand
             runs.setdefault(rel, []).append(run_of(s, sid))
         own = by_sid.get(sid)  # the prompt's frontmatter names this session (claimed later or by hand)
@@ -557,7 +599,8 @@ def progress(prompts: list[Prompt], runs: dict[str, list[dict[str, Any]]]) -> li
     mods: dict[str, dict[str, Any]] = {}
     for p in prompts:
         m = mods.setdefault(p.module, {"module": p.module, "total": 0, "finished": 0, "counts": {},
-                                       "running": [], "stalled": [], "blocked": [], "next": None, "prompts": []})
+                                       "running": [], "stalled": [], "blocked": [], "active": [], "next": None,
+                                       "prompts": []})
         status = effective_status(p, runs.get(p.rel, []))
         m["prompts"].append((p, status))
         m["counts"][status] = m["counts"].get(status, 0) + 1
@@ -572,6 +615,10 @@ def progress(prompts: list[Prompt], runs: dict[str, list[dict[str, Any]]]) -> li
             m["stalled"].append(p)
         elif status == "blocked":
             m["blocked"].append(p)
+        if status not in ("running", "stalled"):  # a live session on an on-branch / on-main / … prompt (CC8: A06)
+            live = [r for r in runs.get(p.rel, []) if r.get("live")]
+            if live:
+                m["active"].append((p, live[0]))
     for m in mods.values():
         done_ids = {p.id for p, s in m["prompts"] if s in FINISHED}
         for p, s in sorted(m["prompts"], key=lambda ps: (_order_key(ps[0].order), ps[0].name)):
