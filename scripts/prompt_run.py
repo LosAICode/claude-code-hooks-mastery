@@ -30,6 +30,9 @@ POLL_S = 5
 _STAMP = re.compile(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
 
 
+clock: Callable[[], float] = time.time  # a deploy's start/end stamps (CC11: the DST tests pin it)
+
+
 def lock_path(umap: dict[str, Any]) -> str:
     return str((umap.get("deploy") or {}).get("lock") or DEPLOY_LOCK)
 
@@ -153,7 +156,7 @@ def execute(plan: dict[str, Any], umap: dict[str, Any], repo: str, owner_ok: str
         rid = time.strftime("%Y%m%dT%H%M%S")
         path = tracker_deploys() / f"{rid}.json"
         rec: dict[str, Any] = {
-            "id": rid, "owner_ok": owner_ok, "session": pr.own_session(), "started": int(time.time()),
+            "id": rid, "owner_ok": owner_ok, "session": pr.own_session(), "started": int(clock()),
             "plan": {"prompts": [f"{e['module']}/{e['id'] or e['name']}" for e in plan["prompts"]], "units": plan["units"],
                      "steps": [{"unit": s["unit"], "commands": s["commands"]} for s in plan["steps"]]},
             "steps": [], "result": None, "deployed": [], "end": None}
@@ -161,7 +164,7 @@ def execute(plan: dict[str, Any], umap: dict[str, Any], repo: str, owner_ok: str
         env = {**os.environ, "NEUROGEN_DEPLOY_RUN": rid}
         wait_s = float(dep.get("proof_wait_s") or PROOF_WAIT_S)
         for i, st in enumerate(plan["steps"]):
-            start = int(time.time())
+            start = int(clock())
             row: dict[str, Any] = {"unit": st["unit"], "start": start, "end": None, "commands": [], "proofs": []}
             rec["steps"].append(row)
             failed = None
@@ -180,9 +183,9 @@ def execute(plan: dict[str, Any], umap: dict[str, Any], repo: str, owner_ok: str
                 row["proofs"] = prove(st, umap, start, run, sleep, wait_s)
                 bad = [p for p in row["proofs"] if not p["ok"]]
                 failed = f"proof failed: {bad[0]['cmd']} → {bad[0]['out'][:120] or '(nothing)'}" if bad else None
-            row["end"] = int(time.time())
+            row["end"] = int(clock())
             if failed:
-                rec["result"], rec["end"] = f"failed at {st['unit']}: {failed}", int(time.time())
+                rec["result"], rec["end"] = f"failed at {st['unit']}: {failed}", int(clock())
                 write_record(path, rec)
                 live = [s["unit"] for s in plan["steps"][:i]]
                 out(f"STOPPED at {st['unit']}: {failed}")
@@ -202,5 +205,5 @@ def execute(plan: dict[str, Any], umap: dict[str, Any], repo: str, owner_ok: str
 
 def finish(rec: dict[str, Any], deployed: list[str]) -> None:
     path = Path(rec.pop("_path"))
-    rec["deployed"], rec["end"] = deployed, int(time.time())
+    rec["deployed"], rec["end"] = deployed, int(clock())
     write_record(path, rec)

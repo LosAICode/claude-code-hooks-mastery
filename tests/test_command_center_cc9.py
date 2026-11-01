@@ -29,8 +29,8 @@ FAKE_SYSTEMCTL = """#!/bin/sh
 S="$FAKE_STATE"
 for unit; do :; done
 case "$1" in
-  restart) date +%s > "$S/start-$unit"; echo "$unit" >> "$S/restarted"
-           echo "[$(date '+%Y-%m-%d %H:%M:%S'),000: INFO/MainProcess] w@h ready." >> "$S/celery.log" ;;
+  restart) T="${FAKE_NOW:-$(date +%s)}"; echo "$T" > "$S/start-$unit"; echo "$unit" >> "$S/restarted"
+           echo "[$(date -d "@$T" '+%Y-%m-%d %H:%M:%S'),000: INFO/MainProcess] w@h ready." >> "$S/celery.log" ;;
   show) t=$(cat "$S/start-$unit" 2>/dev/null)
         if [ -n "$t" ]; then echo ActiveState=active; echo "ActiveEnterTimestamp=@$t"; else echo ActiveState=inactive; fi ;;
   *) exit 1 ;;

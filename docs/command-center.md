@@ -48,7 +48,7 @@ Flat `key: value` lines (YAML-compatible; lists as `[a, b]`; a value a YAML read
 | `needs_owner`, `cost`, `depends_on` | what the owner must decide (`inbox`; "answered …" closes it), what the run costs (`inbox`, `proofs` rank it: free · unknown · paid), ids that must be done first |
 | `session_id`, `commits`, `deployed`, `updated`, `notes` | who claimed it, every commit it shipped (`[sha, …]`; `set --commit` appends; the older single `commit:` is still read and folded in on the next `set`), when it went live, last change, one line |
 | `progress` | how far a running prompt is: `"3/6"` or `"3/6 tests red"` (`set … running --progress 3/6`; a bare `3` takes the numbered items under `## Do` as its total). Shown in the view, `--module`, the module tables, the HTML and `--json` |
-| `tests` | the verdict behind a landing: `"<SUMMARY line> · <results file> · <sha tested>"` (`set --tests`), `"<text> · <sha>"`, or `"none: <why>"` (`--no-tests`, a docs/config landing). `deploy-plan` lists what it would ship without one |
+| `tests` | the verdict behind a landing: `"<SUMMARY line> · <results file> · <sha tested>"` (`set --tests`), `"<text> · <sha>"` (a value that is not an existing file is text, whatever its length; its first 300 characters are kept, CC11), or `"none: <why>"` (`--no-tests`, a docs/config landing). `deploy-plan` lists what it would ship without one |
 | `proof` | recommended for a new prompt (optional for old ones): what proves it live (script, probe account, cost); else `proofs` uses the first "live" bullet under `## Done when` |
 | `after`, `run_last` | optional: `[ID, …]` that must be done first besides `depends_on`; `true` = not while another prompt of the module runs or is on a branch. Without them `next` reads "Run after <ID>" / "Run last" in the body (a quoted mention is not a hint) |
 | `todo: confirm` | written by `migrate` when it could not read the old README row: check the status by hand |
@@ -169,6 +169,14 @@ with the guards that must hold right before it (`before:`, e.g. 0 live calls bef
 
 Without a `deploy` block it uses the map's own unit order and plain `systemctl restart`, with a note.
 
+**Commits in a second repo** (CC11). `commits:` may hold shas from any repo in `prompts.repos`
+(`[{"name": "hooks", "path": "/opt/claude-code-hooks-mastery", "live_at_merge": true}]`). A sha that is not in the
+project repo is looked up on each listed repo's own main line; it lands there, needs none of the map's units and, for a
+`live_at_merge` repo (its hooks and scripts run from the tree), is live when it lands. `deploy-check`, `deploy-plan`
+and `audit` show it as `hooks:<sha>`; only a sha found in no repo says `<sha> is not in any repo` (live 11-01: CC9 and
+CC10 listed `c1c6ea0`, `fa7279d` … and could never read as live). The tracker credits a claimed prompt with its
+session's commits in a listed repo too (the "only the prompts tree" skip applies to the project repo only).
+
 **Rebased commits** (CC9). A sha in `commits:` that is not on main (the commit before a rebase, which the hook
 recorded: R9's `0fa179e48`, 10-31) resolves to the main commit with the same `git patch-id`, else the same subject and
 author. `deploy-check` and `deploy-plan` use the new sha and print `<old> → <new> (rebased)`; a resolved sha the prompt
@@ -180,7 +188,10 @@ no `locks` file held (`flock -n`; a suite in the sandbox); no merge or rebase in
 uncommitted change the unit map maps to a unit or that is live at merge (static JS); every migration to apply chains
 from prod's `alembic_version` or another shipped migration, with one head (prod unread = WAIT); no other live session
 landing now (a pending git commit/merge snapshot in the repo, or a code commit recorded within `landing_window_min`;
-the calling session and `docs(prompts):` status commits are skipped). One line per check (`OK  <name>` or
+the calling session and `docs(prompts):` status commits are skipped; CC11: so are, with `--answer <id>`, the requesting
+session, and a commit whose files need no unit, such as tests or docs: live 11-01 07:42 A03's request waited on its own
+one-file test commit); and (CC11, `main_line`, on by default) main's newest landing did not put a branch on its
+first-parent line (see `audit`'s main-line check). One line per check (`OK  <name>` or
 `WAIT: <name>: <detail>`), the verdict `Deploy: OK` / `Deploy: WAIT (<n> reasons)`, then what would ship (prompts,
 units, migrations to apply, not proven tested). Exit 0 OK, 1 WAIT, 2 unit map unreadable.
 
@@ -245,7 +256,19 @@ reference`?): all report only, it never moves or deletes the owner's files; and 
   names another prompt's id and not its own (an exact, case-sensitive token; a two-character id or one two modules share
   counts only with its module named; digit-only ids are ignored). Fix by editing `commits:` by hand. Live 11-01: R9
   lists M02's `280389595`;
+  (CC11) not a hit: a merge subject (`Merge …` names the branch it merged); the prompt's own base id (`A04` for
+  `A04b`); an alias of the prompt (its `aliases:` list, or a prompt of its module that lists the same sha:
+  connections `01` and `C1`); a prompt of its own module when the subject's conventional scope `type(<scope>):` is
+  that module (A03's `test(assistants): … A01's payer check`, owner's choice 11-01).
 - (CC10) `map-check` gaps, one line per unit.
+- (CC11) `main line: <sha> "<subject>" put a branch on main's first-parent line`: within `prompts.main_line_days`
+  (default 3), a first-parent commit on main whose subject is `Merge branch 'main' into …`, or a reflog move of main
+  whose old tip left the first-parent line (a custom merge message). That is main fast-forwarded to a branch that
+  merged main (live 11-01 00:48: A03's `06ea8ab38` and `d328522f0`), which moves every main commit since the fork off
+  the line. `origin/main` merged into main (the push-main sync) keeps main as its first parent and is not flagged.
+  Land a branch from the live tree with `git merge --no-ff <branch>`; never fast-forward main to a branch that merged
+  main, and never rewrite main to "fix" it. `deploy-ready` WAITs on it only while it is still main's newest landing
+  (only status or prompts-tree commits after it).
 
 **`hold <module>/<ID> --owner "<quote>"`** / **`unhold <module>/<ID>`** (CC10) write or remove
 `hold: {"owner": "<quote>", "by": "<session id>", "at": "<ISO time>"}` in the prompt's frontmatter, as a status commit.
@@ -323,8 +346,9 @@ the command then says so and the next run catches up. `board-check` ignores the 
   is the coordinator; when the restart's own segment sets `NEUROGEN_DEPLOY_RUN=<id>` and `deploys/<id>.json` has no
   `end`; when it sets `NEUROGEN_DEPLOY_OVERRIDE="<reason>"` (appended to `deploys/overrides.jsonl`); or when every unit
   it names is down (an outage restart is never stopped; `restart_web.sh` names the three web units). An error reading
-  `systemctl is-active` lets it through (logged). Otherwise: "Ask the Command Center: send `deploy request
-  <module>/<ID>` to the /cc session; it answers with `deploy-ready`."
+  `systemctl is-active` lets it through (logged). Otherwise (CC11 wording): "Queue a request: run
+  `command_center.py request <module>/<ID>` (it prints the request id), then SendMessage the /cc session
+  `deploy request <module>/<ID> <request id>`; it answers with `deploy-ready`."
 - **Verify gate** (owner 11-01, on whenever `board_gate.repo` is set). The same restarts, plus
   `command_center.py deploy-run` without `--dry-run` (it restarts units from Python, out of the hook's sight), are
   stopped while a `board_gate.code_paths` file changed on `board_gate.branch` since the newest record in
@@ -337,8 +361,8 @@ the command then says so and the next run catches up. `board-check` ignores the 
   session that only stopped to ask a question (no commits), and a read error lets the stop through (logged).
   (CC10) While a background subagent is open (SubagentStart adds its `agent_id` to the session's `open_agents`,
   SubagentStop removes it; an entry older than 6 h counts as closed), the status and progress gates do not fire and
-  do not spend their one block: a turn end while builders run is not the end of the work (live 11-01). The board and
-  claim gates are unchanged.
+  do not spend their one block: a turn end while builders run is not the end of the work (live 11-01). (CC11) The
+  board gate waits the same way; the claim gate is unchanged.
 - **Progress gate.** After the status gate has had its one block, a later Stop is blocked once more when the prompt is
   still `running` under the session and the session committed code (not a status commit) after the prompt's `updated`
   (its claim or last `set`): it asks for `set … running --progress <done>/<total>`. The two never ask in the same stop.
@@ -365,6 +389,8 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `unit_map`, `main_branch` | `deploy-check`: the project's path → unit map (repo-relative JSON) and the branch it lands on (default `main`) |
 | `status_board` | `board-check`: the hand-written Status Board (repo-relative) |
 | `deploy_coordinator` | `{"session": "<id or ≥8-char prefix>"}`: the `/cc` session whose restarts pass the restart gate; unset = the gate is off |
+| `repos` | (CC11) other repos a prompt's `commits:` may name: `[{"name", "path", "live_at_merge", "branch"}]` (see Commits in a second repo) |
+| `main_line_days` | (CC11) how far back `audit` and `deploy-ready` look for main fast-forwarded to a branch that merged main (default 3) |
 | `prod_revision` | `deploy-plan`: a read-only shell query printing prod's `alembic_version` head(s), e.g. `psql -h 127.0.0.1 -U postgres -d neurogenserver -tAc 'SELECT version_num FROM alembic_version'`; unset = "alembic_version unread" |
 
 ## Migration

@@ -659,20 +659,30 @@ def _is_status_commit(subject: str) -> bool:
 
 def _credit_prompt(data: dict[str, Any], rows: list[dict[str, Any]], cfg: dict[str, Any], git: GitRunner) -> None:
     """Append the claimed prompt's work to its ``commits:``: commits in the prompts repo, not a status commit and
-    not one that touches only the prompts tree (CC7: R4's fix landed unrecorded, so deploy-check called R4 live)."""
+    not one that touches only the prompts tree (CC7: R4's fix landed unrecorded, so deploy-check called R4 live),
+    and commits in a repo listed in ``prompts.repos`` (CC11: CC9/CC10's hooks-repo work)."""
     spec = cfg.get("prompts")
     if not isinstance(spec, dict) or not spec.get("repo"):
         return
     repo = str(spec["repo"])
     rid = repo_id(repo, git)
+    extra = set()
+    for r in spec.get("repos") or []:
+        path = str(r.get("path") or "") if isinstance(r, dict) else ""
+        if path and os.path.isdir(path):
+            try:
+                extra.add(repo_id(path, git))
+            except GitError:
+                pass
     root = str(spec.get("root") or "").strip("/") + "/"
     shas = []
     for c in rows:
-        if c.get("repo") != rid or _is_status_commit(c.get("subject") or ""):
+        if c.get("repo") not in {rid, *extra} or _is_status_commit(c.get("subject") or ""):
             continue
-        files = _changed_files(str(c.get("dir") or repo), c["sha"], git)
-        if files and all(f.startswith(root) for f in files):
-            continue
+        if c.get("repo") == rid:
+            files = _changed_files(str(c.get("dir") or repo), c["sha"], git)
+            if files and all(f.startswith(root) for f in files):
+                continue
         shas.append(c["sha"])
     if not shas:
         return
@@ -826,9 +836,10 @@ def track(event: str, payload: dict[str, Any]) -> None:
 DEFAULT_RESTART_PATTERNS = [r"scripts/restart_web\.sh", r"systemctl\s+(?:try-)?(?:restart|stop|start)\s+neurogenserver"]
 WEB_UNITS = ["neurogenserver", "neurogenserver-web@5027", "neurogenserver-web@5028"]
 RESTART_BLOCK_REASON = (
-    "BLOCKED: restarts are coordinated by the Command Center. Ask the Command Center: send `deploy request "
-    "<module>/<ID>` to the /cc session; it answers with `deploy-ready`. (Outage: a unit that is down can always be "
-    "restarted; override: NEUROGEN_DEPLOY_OVERRIDE=\"<reason>\", logged.)"
+    "BLOCKED: restarts are coordinated by the Command Center. Queue a request: run `python3 "
+    "/opt/claude-code-hooks-mastery/scripts/command_center.py request <module>/<ID>` (it prints the request id), then "
+    "SendMessage the /cc session `deploy request <module>/<ID> <request id>`; it answers with `deploy-ready`. "
+    "(Outage: a unit that is down can always be restarted; override: NEUROGEN_DEPLOY_OVERRIDE=\"<reason>\", logged.)"
 )
 _DEPLOY_ID = re.compile(r"^[\w.-]+$")
 
@@ -1054,7 +1065,7 @@ def gate_reason(
     gate = cfg.get("board_gate")
     if not gate or not session or payload.get("stop_hook_active"):
         return None
-    if session.get("board_gate_blocked"):
+    if session.get("board_gate_blocked") or open_agents(session):  # CC11: like the status and progress gates
         return None
     repo = str(gate["repo"])
     branch = str(gate.get("branch") or "main")

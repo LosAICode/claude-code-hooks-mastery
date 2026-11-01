@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,29 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / ".claude" / "hooks" / "utils"))
 sys.path.insert(0, str(ROOT / "scripts"))
+
+
+# Every test runs in one known zone: the one the run was started with (``TZ=America/New_York pytest …``), else UTC
+# (CC11: at 01:02 EST, the repeated DST hour, three deploy-run tests failed on an unchanged main). Set at import, so
+# the test modules' own module-level times (``NOW_DT``) are read in it too.
+os.environ["TZ"] = os.environ.get("TZ") or "UTC"
+time.tzset()
+PINNED_TZ = os.environ["TZ"]
+
+
+@pytest.fixture(autouse=True)
+def pinned_tz():
+    """Back to the pinned zone after a test that switched it (``use_tz``)."""
+    old = PINNED_TZ
+    yield
+    os.environ["TZ"] = old
+    time.tzset()
+
+
+def use_tz(monkeypatch, name: str) -> None:
+    """Switch this test (and the processes it starts) to ``name``; the pin restores the zone after it."""
+    monkeypatch.setenv("TZ", name)
+    time.tzset()
 
 
 @pytest.fixture

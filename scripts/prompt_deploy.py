@@ -12,6 +12,7 @@ are read with ``systemctl show`` (read-only: nothing here restarts anything).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -105,10 +106,15 @@ def unit_started(unit: str) -> int | None:
 
 
 class History:
-    """main's first-parent line, read once, and where a commit landed on it."""
+    """main's first-parent line, read once, and where a commit landed on it.
 
-    def __init__(self, repo: str, branch: str = "main") -> None:
-        self.repo, self.branch = repo, branch
+    ``others``: the repos in ``prompts.repos`` (CC11: CC9/CC10 list hooks-repo shas). A sha that is not in this repo
+    is looked up in each of them; a hit there carries ``repo`` (its name) and ``live_at_merge``."""
+
+    def __init__(self, repo: str, branch: str = "main", name: str | None = None, live_at_merge: bool = False,
+                 others: list[History] | None = None) -> None:
+        self.repo, self.branch, self.name, self.live_at_merge = repo, branch, name, live_at_merge
+        self.others = list(others or [])
         out = self._git("log", "--first-parent", "--format=%H %ct", branch) or ""
         rows = [line.split() for line in out.splitlines() if line]
         self.first_parent = {sha: int(ct) for sha, ct in rows}
@@ -123,7 +129,20 @@ class History:
         return p.stdout if p.returncode == 0 else None
 
     def landing(self, ref: str) -> tuple[dict[str, Any] | None, str | None]:
-        """({sha, landed, files}, None), or (None, why it can't be checked)."""
+        """({sha, landed, files}, None), or (None, why it can't be checked); a sha in another listed repo lands there
+        (``repo``, ``live_at_merge`` set), and only one in no repo is "not in any repo"."""
+        got, why = self._landing(ref)
+        if got is not None or why != f"{ref} is not in this repo" or not self.others:
+            return got, why
+        for other in self.others:
+            got, why = other._landing(ref)
+            if got is not None:
+                return {**got, "repo": other.name, "live_at_merge": other.live_at_merge}, None
+            if why != f"{ref} is not in this repo":
+                return None, f"{other.name}:{why}"
+        return None, f"{ref} is not in any repo"
+
+    def _landing(self, ref: str) -> tuple[dict[str, Any] | None, str | None]:
         full = (self._git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") or "").strip()
         if not full:
             return None, f"{ref} is not in this repo"
@@ -190,6 +209,18 @@ class History:
         return [(c, pid) for pid, c in (line.split() for line in p.stdout.splitlines() if len(line.split()) == 2)]
 
 
+def history_for(spec: dict[str, Any]) -> History:
+    """The prompts repo's main line, with every other repo in ``prompts.repos`` to look a sha up in."""
+    primary = os.path.normpath(str(spec["repo"]))
+    others = []
+    for r in spec.get("repos") or []:
+        path = str((r or {}).get("path") or "") if isinstance(r, dict) else ""
+        if path and os.path.normpath(path) != primary and os.path.isdir(path):
+            others.append(History(path, str(r.get("branch") or "main"), name=str(r.get("name") or Path(path).name),
+                                  live_at_merge=bool(r.get("live_at_merge"))))
+    return History(str(spec["repo"]), str(spec.get("main_branch") or "main"), others=others)
+
+
 commits_of = pc.commits_of
 
 
@@ -225,12 +256,17 @@ def check(prompts: list[Any], umap: dict[str, Any], history: History) -> list[di
             if got is None:
                 skipped.append(why)
                 continue
-            if got["sha"] in seen:  # a rebased sha listed next to its new one: one commit
+            repo = got.get("repo")
+            if (repo, got["sha"]) in seen:  # a rebased sha listed next to its new one: one commit
                 continue
-            seen.add(got["sha"])
-            units, merge_live = needs(got["files"], umap)
+            seen.add((repo, got["sha"]))
+            # another repo's commit needs none of this map's units (its own code is live when it lands, or not ours)
+            units, merge_live = (set(), bool(got.get("live_at_merge"))) if repo else needs(got["files"], umap)
             at_merge = at_merge or merge_live
-            row = {"sha": got["sha"][:9], "landed": got["landed"], "needs": sorted(units), "files": got["files"]}
+            row = {"sha": f"{repo}:{got['sha'][:9]}" if repo else got["sha"][:9], "landed": got["landed"],
+                   "needs": sorted(units), "files": got["files"]}
+            if repo:
+                row["repo"] = repo
             if old:
                 row["rebased_from"] = old
             e["commits"].append(row)
