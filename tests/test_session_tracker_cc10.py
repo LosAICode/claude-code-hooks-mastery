@@ -1,4 +1,5 @@
 """CC10 item 6: the Stop gate waits while background subagents run (SubagentStart opens one, SubagentStop closes it)."""
+# ruff: noqa: F811  (the tests take the CC7 `gated` fixture, imported by name)
 import json
 import os
 import time
