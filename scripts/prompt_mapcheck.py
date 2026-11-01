@@ -170,7 +170,8 @@ def chain(parent: dict[str, str | None], rel: str) -> list[str]:
 
 
 def entries(umap: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return ((umap.get("deploy") or {}).get("entry")) or {}
+    """The units in ``deploy.entry``; its ``about`` note (and any other non-object value) is not one."""
+    return {k: v for k, v in (((umap.get("deploy") or {}).get("entry")) or {}).items() if isinstance(v, dict)}
 
 
 def check(repo: str | Path, umap: dict[str, Any], unit: str | None = None,

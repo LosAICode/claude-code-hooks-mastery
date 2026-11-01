@@ -155,3 +155,10 @@ def test_statement_forms_the_line_scanner_must_cut(tmp_path):
     reached = mc.Walker(r).walk(["src/main.py"], ["src"])
     assert set(reached) == {"src/main.py", "src/one.py", "src/pkg/__init__.py", "src/pkg/two.py",
                             "src/pkg/three.py", "src/pkg/four.py"}
+
+
+def test_an_about_note_in_the_entry_block_is_not_a_unit(proj):
+    """Every block of deploy_units.json carries an "about" string; map-check must not read it as a unit."""
+    umap = load(proj)
+    umap["deploy"]["entry"] = {"about": "what this block is", **umap["deploy"]["entry"]}
+    assert list(mc.check(proj, umap)) == ["app-channels"]
