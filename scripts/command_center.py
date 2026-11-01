@@ -13,6 +13,7 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
                                           [--notes TEXT] [--needs-owner TEXT] [--comment] [--close] [--no-commit]
     python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]  # prompts × GitHub issues
     python3 scripts/command_center.py audit [--module M]       # exit 1 when it finds something
+    python3 scripts/command_center.py map-check [--unit U] [--map FILE] [--json]  # imports no unit-map rule covers (exit 1)
     python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts (read-only)
     python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line per module row
     python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
@@ -818,6 +819,13 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
         umap = pd.load_map(view.spec)
     except (OSError, ValueError):
         umap = None
+    if umap and not module:
+        import prompt_mapcheck as mc
+
+        for unit, res in mc.check(str(view.spec["repo"]), umap).items():
+            line = mc.finding(unit, res)
+            if line:
+                out.append(line)
     for r in pp.unrecorded_commits(view.prompts, str(view.spec["repo"]),
                                    str(view.spec.get("main_branch") or "main"), umap):
         q = r["prompt"]
@@ -912,6 +920,38 @@ def cross_prompt_findings(view: View, module: str | None = None) -> list[str]:
 def cmd_audit(view: View, args: argparse.Namespace) -> int:
     found = audit_findings(view, args.module)
     print("\n".join(found) if found else "audit: nothing to report")
+    return 1 if found else 0
+
+
+def cmd_map_check(view: View, args: argparse.Namespace) -> int:
+    import prompt_deploy as pd
+    import prompt_mapcheck as mc
+
+    spec = {**view.spec, "unit_map": args.map} if args.map else view.spec
+    try:
+        umap = pd.load_map(spec)
+    except (OSError, ValueError) as e:
+        print(f"unit map unreadable: {e}", file=sys.stderr)
+        return 2
+    if umap is None or not mc.entries(umap):
+        print("no deploy.entry block in the unit map (see docs/command-center.md)", file=sys.stderr)
+        return 2
+    if args.unit and args.unit not in mc.entries(umap):
+        print(f"no deploy.entry for {args.unit!r}; entries: " + ", ".join(mc.entries(umap)), file=sys.stderr)
+        return 2
+    results = mc.check(str(view.spec["repo"]), umap, args.unit)
+    found = any(r["gaps"] or r["missing"] for r in results.values())
+    if args.json:
+        print(json.dumps({"units": results}, indent=1))
+        return 1 if found else 0
+    lines = []
+    for unit, r in results.items():
+        bad = len(r["gaps"]) + len(r["missing"])
+        lines.append(f"{unit}: reaches {r['reached']} file(s), " + (f"{bad} no rule maps" if bad else "no gaps"))
+        lines += [f"  {f} (entry file missing)" for f in r["missing"]]
+        for g in r["gaps"]:
+            lines += [f"  {g['file']}", f"    {' → '.join(g['chain'])}"]
+    print("\n".join(lines))
     return 1 if found else 0
 
 
@@ -1733,6 +1773,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     i.add_argument("--no-commit", action="store_true")
     au = sub.add_parser("audit", help="data problems: no commit, todo left, folder vs status, ids, lower-case folders")
     au.add_argument("--module")
+    mp = sub.add_parser("map-check", help="files a unit's entry imports that no unit-map rule for it matches; 0 none, 1 gaps")
+    mp.add_argument("--unit", help="one deploy.entry unit")
+    mp.add_argument("--map", help="another unit map file (repo-relative or absolute) instead of prompts.unit_map")
+    mp.add_argument("--json", action="store_true")
     sub.add_parser("board-check", help="Status Board rows that say HELD/ON MAIN or DEPLOYED/LIVE against a prompt's status")
     bm = sub.add_parser("board-markers", help="add a generated Prompts: line to the first Status Board row per module")
     bm.add_argument("--no-commit", action="store_true")
@@ -1824,6 +1868,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_issues(view, args)
     if args.cmd == "audit":
         return cmd_audit(view, args)
+    if args.cmd == "map-check":
+        return cmd_map_check(view, args)
     if args.cmd == "board-check":
         return cmd_board_check(view, args)
     if args.cmd == "board-markers":
