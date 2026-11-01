@@ -196,6 +196,7 @@ def test_restart_gate_blocks_a_non_coordinator(tracker_env, cmd):
 
 @pytest.mark.parametrize("cmd", [
     "systemctl show -p ActiveEnterTimestamp neurogenserver-celery",
+    "systemctl show neurogenserver-celery -p ActiveEnterTimestamp",
     "systemctl status neurogenserver-celery",
     "systemctl is-active neurogenserver",
     "grep -n x scripts/restart_web.sh",
