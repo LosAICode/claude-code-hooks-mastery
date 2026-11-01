@@ -125,7 +125,9 @@ session, a prompt another live session holds, and anything past `blocked` (a pro
 
 **`deploy-check`** answers "is it live?" per unit. For each `on-main` and `deployed` prompt it reads every commit in
 `commits:` (and the older `commit:`); it is live only when all of them are. It finds where each landed on main (the first first-parent commit that contains it: a branch commit lands at
-its merge, not at its author time), lists the files that landing brought (a merge named by its sha: its branch; a plain commit: only its own change, CC10, since
+its merge, not at its author time; CC12: a first-parent commit lands at the earliest time main's reflog held a tip
+that contains it, so a commit that came in by a fast-forward lands then, not at its committer date: live 11-01 R3's
+`6ba6cc1e1` read as landed 10-30 23:15; no reflog = the committer date), lists the files that landing brought (a merge named by its sha: its branch; a plain commit: only its own change, CC10, since
 live 11-01 a main merged into a branch and fast-forwarded put main's own commits off the first-parent line), and maps them to units with the project's
 map (`unit_map`; NeuroGenServer `scripts/deploy_units.json`, which `ops_drift.py` reads too: one map, owner decision
 10-30). A file needs the units of every rule it matches; a `live_at_merge` rule (static files) is live when it lands;
@@ -145,11 +147,12 @@ or on-branch one). It then lists, report only, Status Board clauses that say "ow
 
 **`deploy-plan`** takes every `on-main` prompt and every `deployed` one that is half live or waiting (a later commit
 not live yet), runs `deploy-check`'s logic on them and prints, in order: the prompts and the units each still waits
-on; the migrations among their commits (files under `deploy.migrations`) to apply BY HAND first (one whose own
-commit's units all started after that commit landed ran at boot and is shown apart, even while a later commit of the
-same prompt still waits: R4, 10-31), and one at or below prod's `alembic_version` is shown apart as "already in
+on; the migrations among their commits (files under `deploy.migrations`, one row per file from its newest commit,
+CC12) to apply BY HAND first, and one at or below prod's `alembic_version` is shown apart as "already in
 prod" (the config's `prod_revision` query; read-only; any error = "alembic_version unread" and the whole list stays:
-R4b/R5 were listed 10-31 while prod was already at r5). The walk parses `revision`/`down_revision` (merge tuples too)
+R4b/R5 were listed 10-31 while prod was already at r5). Only while `alembic_version` is unread, one whose commit's
+units all started after it landed is guessed to have run at boot and is shown apart (R4, 10-31); with prod read,
+prod decides (CC12: live 11-01 R3's migration read as both "to apply" and "ran at boot" while prod lacked it). The walk parses `revision`/`down_revision` (merge tuples too)
 in the migrations folder, never imports a file; "Not proven tested": every prompt it ships with no `tests:`, a tested sha that is
 not on main, or a commit that landed after the tested sha; the guards; one restart step per unit in `deploy.order` that is needed
 (a group's own command, e.g. `restart_web.sh` under the deploy lock, else `systemctl restart <unit>` per member), each
@@ -165,7 +168,7 @@ with the guards that must hold right before it (`before:`, e.g. 0 live calls bef
 | `proof`, `ready`, `after_each` | per unit (`{unit}` filled in); `{unit: its ready-line grep}`; after every step (health ×3) |
 
 | `lock`, `freeze_file`, `proof_wait_s` | `deploy-run`'s lock (default `/run/lock/neurogen-aa-deploy.lock`); the freeze file the `/cc` line checks (default `/run/lock/neurogen-deploy-freeze`); how long a unit's start-time and ready-line proofs poll (default 120 s) |
-| `ready_checks` | `deploy-ready`'s own checks: `min_available_mb` (default 1500), `locks` (files that must not be held, e.g. the sandbox lock; default none), `merge_state`, `dirty_units`, `migration_chain` (booleans, default on), `landing_window_min` (default 10) |
+| `ready_checks` | `deploy-ready`'s own checks: `min_available_mb` (default 1500), `locks` (files that must not be held, e.g. the sandbox lock; default none), `merge_state`, `dirty_units`, `migration_chain`, `main_line`, `verify` (booleans, default on), `landing_window_min` (default 10) |
 
 Without a `deploy` block it uses the map's own unit order and plain `systemctl restart`, with a note.
 
@@ -191,7 +194,8 @@ landing now (a pending git commit/merge snapshot in the repo, or a code commit r
 the calling session and `docs(prompts):` status commits are skipped; CC11: so are, with `--answer <id>`, the requesting
 session, and a commit whose files need no unit, such as tests or docs: live 11-01 07:42 A03's request waited on its own
 one-file test commit); and (CC11, `main_line`, on by default) main's newest landing did not put a branch on its
-first-parent line (see `audit`'s main-line check). One line per check (`OK  <name>` or
+first-parent line (see `audit`'s main-line check); and (CC12, `verify`, on by default, only while `board_gate.repo`
+is set) a `/verify` record covers main's code, so the verify gate would let the restart through. One line per check (`OK  <name>` or
 `WAIT: <name>: <detail>`), the verdict `Deploy: OK` / `Deploy: WAIT (<n> reasons)`, then what would ship (prompts,
 units, migrations to apply, not proven tested). Exit 0 OK, 1 WAIT, 2 unit map unreadable.
 
