@@ -107,12 +107,13 @@ def proofs(prompts: list[pc.Prompt]) -> list[dict[str, Any]]:
 
 
 _REVISION = re.compile(r"^revision\s*(?::[^=\n]*)?=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
-_DOWN = re.compile(r"^down_revision\s*(?::[^=\n]*)?=\s*(.+)$", re.MULTILINE)
+_DOWN = re.compile(r"^down_revision\s*(?::[^=\n]*)?=\s*(\([^)]*\)|\[[^\]]*\]|.+)$", re.MULTILINE)
 _QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
 
 
 def revision_of(text: str) -> tuple[str | None, list[str]]:
-    """(revision, down_revisions) of an Alembic file, parsed (never imported); a merge has several downs."""
+    """(revision, down_revisions) of an Alembic file, parsed (never imported); a merge has several downs, its tuple
+    over several lines (live 11-01: NeuroGenServer's reconcile_20260520, read as no downs, made 4 heads of one)."""
     rev, down = _REVISION.search(text or ""), _DOWN.search(text or "")
     return (rev.group(1) if rev else None), (_QUOTED.findall(down.group(1)) if down else [])
 

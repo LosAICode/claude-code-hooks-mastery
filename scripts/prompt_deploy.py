@@ -113,6 +113,7 @@ class History:
         rows = [line.split() for line in out.splitlines() if line]
         self.first_parent = {sha: int(ct) for sha, ct in rows}
         self.position = {sha: i for i, (sha, _) in enumerate(rows)}  # 0 = main's tip; higher = older
+        self._resolved: dict[str, str | None] = {}
 
     def _git(self, *args: str) -> str | None:
         try:
@@ -147,6 +148,42 @@ class History:
             return None, f"{ref}: its files could not be read"
         return {"sha": full, "landed": landed, "files": [f for f in raw.split("\0") if f.strip()]}, None
 
+    def resolve(self, ref: str) -> str | None:
+        """The commit on main that ``ref`` became: itself when on main, else the one with the same ``git patch-id``
+        (or, failing that, the same subject and author email) committed since a day before it. None when none is.
+
+        Live 11-01: R9's ``0fa179e48`` was rebased to ``cda15d991`` before the merge, so deploy-check called R9
+        unchecked and deploy-plan showed it "not on main" although it shipped."""
+        if ref in self._resolved:
+            return self._resolved[ref]
+        full = (self._git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") or "").strip()
+        new = None
+        if full and self._git("merge-base", "--is-ancestor", full, self.branch) is not None:
+            new = full
+        elif full:
+            ct = (self._git("log", "-1", "--format=%ct%x00%s%x00%ae", full) or "").strip().split("\0")
+            if len(ct) == 3 and ct[0].isdigit():
+                since = f"--since=@{int(ct[0]) - 86400}"
+                mine = self._patch_ids(self._git("show", full) or "")
+                found = self._patch_ids(self._git("log", "-p", "--reverse", since, self.branch) or "")
+                new = next((sha for sha, pid in found if mine and pid == mine[0][1] and sha != full), None)
+                if new is None:
+                    rows = (self._git("log", "--reverse", since, "--format=%H%x00%s%x00%ae", self.branch) or "").splitlines()
+                    new = next((r.split("\0")[0] for r in rows if r.split("\0")[1:] == ct[1:]), None)
+        self._resolved[ref] = new
+        return new
+
+    def _patch_ids(self, diff: str) -> list[tuple[str, str]]:
+        """[(commit, patch id)] of ``git show``/``git log -p`` output (merges have no patch, so none)."""
+        if not diff:
+            return []
+        try:
+            p = subprocess.run(["git", "-C", self.repo, "patch-id", "--stable"], input=diff, capture_output=True,
+                               text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [(c, pid) for pid, c in (line.split() for line in p.stdout.splitlines() if len(line.split()) == 2)]
+
 
 commits_of = pc.commits_of
 
@@ -171,15 +208,27 @@ def check(prompts: list[Any], umap: dict[str, Any], history: History) -> list[di
         skipped = []
         need_by: dict[str, int] = {}  # unit -> the latest landing among the commits that need it
         at_merge = False
+        seen: set[str] = set()
         for ref in refs:
             got, why = history.landing(ref)
+            old = None
+            if got is None and str(why).endswith(f"not on {history.branch}"):
+                new = history.resolve(ref)
+                if new:
+                    old = (history._git("rev-parse", "--short=9", ref) or ref).strip()[:9]
+                    got, why = history.landing(new)
             if got is None:
                 skipped.append(why)
                 continue
+            if got["sha"] in seen:  # a rebased sha listed next to its new one: one commit
+                continue
+            seen.add(got["sha"])
             units, merge_live = needs(got["files"], umap)
             at_merge = at_merge or merge_live
-            e["commits"].append({"sha": got["sha"][:9], "landed": got["landed"], "needs": sorted(units),
-                                "files": got["files"]})
+            row = {"sha": got["sha"][:9], "landed": got["landed"], "needs": sorted(units), "files": got["files"]}
+            if old:
+                row["rebased_from"] = old
+            e["commits"].append(row)
             for u in units:
                 need_by[u] = max(need_by.get(u, 0), got["landed"])
         if not e["commits"]:

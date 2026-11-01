@@ -19,6 +19,8 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py inbox [--module M] [--json]        # every open owner ask, oldest first
     python3 scripts/command_center.py deploy-plan [--module M] [--json]  # guards, migrations, restart order, proofs (prints only)
+    python3 scripts/command_center.py deploy-ready [--module M] [--json] # is a deploy safe now (reads only; exit 1 = WAIT)
+    python3 scripts/command_center.py deploy-run --owner-ok "<quote>" [--only STEP] [--dry-run]  # the restarts, proven
     python3 scripts/command_center.py proofs [--module M] [--json]       # deployed prompts and what proves them, free first
     python3 scripts/command_center.py next [--parallel] [--json]         # pending prompts that can start now, and why not the rest
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
@@ -237,6 +239,9 @@ def render_terminal(view: View) -> str:
     lines += [module_line(m) for m in mods]
     if not mods:
         lines.append("(no prompts found; check the prompts block of the tracker config)")
+    deploy = deploy_line(view)
+    if deploy:
+        lines += ["", deploy]
     if rows:
         lines += ["", "Sessions"] + [session_line(r) for r in rows]
     sections = [
@@ -253,6 +258,25 @@ def render_terminal(view: View) -> str:
         if rows:
             lines += ["", title] + [_row(mod, p, tail) for mod, p, tail in rows]
     return "\n".join(lines)
+
+
+def deploy_line(view: View) -> str | None:
+    """``Deploy: OK | WAIT (<first reason>) · last deploy <age>`` from the cheap checks only (freeze file, locks,
+    merge state, memory): the view runs no psql and no systemctl. None without a unit map."""
+    import prompt_deploy as pd
+    import prompt_ready as pr
+    import prompt_run as prun
+
+    try:
+        umap = pd.load_map(view.spec)
+    except (OSError, ValueError):
+        return None
+    if umap is None:
+        return None
+    ok, waits = pr.verdict(pr.cheap(umap, str(view.spec["repo"])))
+    last = prun.last_deploy()
+    return ("Deploy: OK" if ok else f"Deploy: WAIT ({waits[0]})") + (
+        f" · last deploy {age(view.now - last)} ago" if last else " · last deploy never")
 
 
 def owner_ask(p: pc.Prompt) -> str:
@@ -733,6 +757,20 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
         if raw == "deployed" and not pp.proof_row(p)["proof"]:
             out.append(f"{pi.label(p)}: deployed with no proof (no `proof:` line, no live bullet under Done when), "
                        "so `proofs` can't say how to close it")
+    history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+    for p in prompts:
+        if str(p.meta.get("status") or "") not in ("on-main", "deployed", "done") or not p.id:
+            continue
+        refs = pc.commits_of(p.meta)
+        for ref in refs:
+            got, why = history.landing(ref)
+            new = history.resolve(ref) if got is None and str(why).endswith(f"not on {history.branch}") else None
+            if not new:
+                continue
+            if any(new.startswith(r) for r in refs if r != ref):
+                out.append(f"{p.module}/{p.id}: {ref[:9]} was rebased to {new[:9]}, which its commits already list")
+            else:
+                out.append(f"{p.module}/{p.id}: {ref[:9]} was rebased to {new[:9]}: set {p.module}/{p.id} --commit {new[:9]}")
     try:
         umap = pd.load_map(view.spec)
     except (OSError, ValueError):
@@ -1010,6 +1048,11 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
 
 
+def sha_cell(commits: list[dict[str, Any]]) -> str:
+    """The commits as shas; a rebased one as ``old → new (rebased)`` (CC9: R9's shas changed in a rebase)."""
+    return ", ".join(f"{c['rebased_from']} → {c['sha']} (rebased)" if c.get("rebased_from") else c["sha"] for c in commits)
+
+
 def render_deploy(results: list[dict[str, Any]], umap: dict[str, Any], now: float) -> str:
     import prompt_deploy as pd
 
@@ -1029,7 +1072,7 @@ def render_deploy(results: list[dict[str, Any]], umap: dict[str, Any], now: floa
             if state == "unchecked":
                 lines.append(head + str(e["reason"]))
                 continue
-            shas = ", ".join(c["sha"] for c in e["commits"])
+            shas = sha_cell(e["commits"])
             tail = [f"{shas} landed {_hm(e['landed'])}"]
             if state == "live":
                 tail.append(f"live since {_hm(e['live_since'])}" + (f" ({', '.join(pd.compact(e['needs'], umap))})"
@@ -1073,10 +1116,18 @@ def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
     print(render_deploy(results, umap, view.now))
     if not args.apply:
         return 0
+    rels = apply_live(view, results, args.no_commit)
+    if rels:
+        print("\n".join(tell_lines(view, rels)))
+    return 0
+
+
+def apply_live(view: View, results: list[dict[str, Any]], no_commit: bool) -> list[str]:
+    """``--apply``: every on-main prompt live in each unit it needs → deployed (one commit). The rels it set."""
     ready = [e for e in results if e["state"] == "live" and e["status"] == "on-main"]
     if not ready:
         print("\n--apply: nothing to set (only an on-main prompt live in every unit it needs moves to deployed)")
-        return 0
+        return []
     by_rel = {p.rel: p for p in view.prompts}
     rels: list[str] = []
     applied = []
@@ -1092,14 +1143,39 @@ def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
         print(f"{p.module} {p.id or p.name}: on-main → deployed ({_hm(e['live_since'])})")
     ready = applied
     if not ready:
-        return 0
+        return []
     labels: dict[str, list[str]] = {}
     for e in ready:
         labels.setdefault(e["module"], []).append(e["id"] or e["name"])
     what = "; ".join(f"{m} {', '.join(ids)}" for m, ids in labels.items())
     commit_change(view, list(labels), rels, f"docs(prompts): deploy-check: {len(ready)} prompts deployed ({what})",
-                  args.no_commit)
-    return 0
+                  no_commit)
+    return [e["rel"] for e in ready]
+
+
+def tell_lines(view: View, rels: list[str]) -> list[str]:
+    """Who to tell that their prompt is live, and what proof it owes: the session in its frontmatter, if live.
+    The /cc session sends each line with SendMessage (CC9: peers asked "is it live?" by hand)."""
+    import prompt_plan as pp
+
+    live = pc.live_session_ids(view.sessions, view.now)
+    by_sid = {str(s["session_id"]): s for s in view.sessions}
+    by_rel = {p.rel: p for p in view.prompts}
+    out = []
+    for rel in rels:
+        p = by_rel.get(rel)
+        if p is None:
+            continue
+        sid = str(p.meta.get("session_id") or "")
+        owes = pp.proof_row(p)["proof"] or "(no proof: line)"
+        ref = f"{p.module}/{p.id or p.name}"
+        if sid and sid in live:
+            name = by_sid[sid].get("name")
+            who = f"{name} ({sid[:8]})" if name else sid[:8]
+        else:
+            who = "(no live session)"
+        out.append(f"Tell: {who} · {ref} · owes: {owes}")
+    return out
 
 
 # --- planning: inbox, deploy-plan, proofs, next (read-only) ------------------------------------------------
@@ -1200,29 +1276,15 @@ def _proof_line(r: dict[str, Any]) -> str:
         f"  · cost: {r['cost']}" if r["cost"] else "")
 
 
-def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
+def ship_lines(plan: dict[str, Any], umap: dict[str, Any], prod: list[str] | None, query: str | None) -> list[str]:
+    """What would ship: Prompts, Migrations, Not proven tested (deploy-plan and deploy-ready print the same)."""
     import prompt_deploy as pd
-    import prompt_plan as pp
 
-    got = _plan_inputs(view, args)
-    if got is None:
-        return 2
-    prompts, umap, history = got
-    query = view.spec.get("prod_revision")
-    prod = pp.prod_revision(query)
-    plan = pp.deploy_plan(prompts, umap, history, prod=prod, repo=str(view.spec["repo"]))
     head = ", ".join(prod or [])
-    if args.json:
-        print(json.dumps({"now": _iso(view.now), "prod_revision": head or None, **plan}, indent=1, default=str))
-        return 0
-    lines = [f"Deploy plan · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(plan['prompts'])} prompts to ship "
-             "· it prints, it runs nothing"]
-    if plan["note"]:
-        lines.append(f"note: {plan['note']}")
-    lines += ["", "Prompts"]
+    lines = ["", "Prompts"]
     for e in plan["prompts"]:
         label = f"{e['module']} {e['id'] or e['name'].removesuffix('.md')}"
-        shas = ", ".join(c["sha"] for c in e["commits"]) or "-"
+        shas = sha_cell(e["commits"]) or "-"
         tail = (f"waits: {', '.join(pd.compact(e['waits'], umap))}" if e["waits"] else
                 "live: deploy-check --apply sets it deployed" if e["state"] == "live" else e["state"])
         lines.append(f"  {fit(label, 27):<28}{e['status']:<10}{shas} · {tail}" + (f" · {e['reason']}" if e.get("reason") else ""))
@@ -1239,6 +1301,36 @@ def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
               for m in plan["migrations"] if m["applied_at_boot"]]
     lines += ["", "Not proven tested (no passing verdict for what ships; `set … --tests <results file>`)"]
     lines += [f"  {fit(u['module'] + ' ' + (u['id'] or u['rel']), 22):<23}{u['why']}" for u in plan["untested"]] or ["  none"]
+    return lines
+
+
+def _build_plan(view: View, args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], list[str] | None, Any] | None:
+    """(plan, unit map, prod heads, the prod query), or None when the map is unreadable (printed)."""
+    import prompt_plan as pp
+
+    got = _plan_inputs(view, args)
+    if got is None:
+        return None
+    prompts, umap, history = got
+    query = view.spec.get("prod_revision")
+    prod = pp.prod_revision(query)
+    return pp.deploy_plan(prompts, umap, history, prod=prod, repo=str(view.spec["repo"])), umap, prod, query
+
+
+def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
+    got = _build_plan(view, args)
+    if got is None:
+        return 2
+    plan, umap, prod, query = got
+    head = ", ".join(prod or [])
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), "prod_revision": head or None, **plan}, indent=1, default=str))
+        return 0
+    lines = [f"Deploy plan · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(plan['prompts'])} prompts to ship "
+             "· it prints, it runs nothing"]
+    if plan["note"]:
+        lines.append(f"note: {plan['note']}")
+    lines += ship_lines(plan, umap, prod, query)
     lines += ["", "Guards (each must read as expected before the first restart)"]
     lines += [f"  {g['name']}: {g['command']}  → expect {g.get('expect', '')}" for g in plan["guards"] if not g.get("before")] or ["  none in the map"]
     lines += ["", "Restarts (one at a time, each proven before the next)"]
@@ -1253,6 +1345,111 @@ def cmd_deploy_plan(view: View, args: argparse.Namespace) -> int:
     lines += ["", f"Then: python3 {Path(__file__).resolve()} deploy-check --apply, and the proofs owed:"]
     lines += [_proof_line(r) for r in plan["proofs"]] or ["  none"]
     print("\n".join(lines))
+    return 0
+
+
+def _ready_lines(checks: list[dict[str, Any]]) -> list[str]:
+    import prompt_ready as pr
+
+    ok, waits = pr.verdict(checks)
+    lines = [f"OK  {c['name']}" + (f" ({c['detail']})" if c["detail"] else "") if c["ok"] else
+             f"WAIT: {c['name']}: {c['detail']}" for c in checks]
+    return lines + ["", "Deploy: OK" if ok else f"Deploy: WAIT ({len(waits)} reasons)"]
+
+
+def cmd_deploy_ready(view: View, args: argparse.Namespace) -> int:
+    """Is a deploy safe now: the guards and ready checks (all reads), then what would ship. 0 OK, 1 WAIT, 2 no map."""
+    import prompt_ready as pr
+
+    got = _build_plan(view, args)
+    if got is None:
+        return 2
+    plan, umap, prod, query = got
+    checks = pr.ready(view, umap, plan, prod)
+    ok, waits = pr.verdict(checks)
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), "verdict": "OK" if ok else "WAIT", "waits": waits, "checks": checks,
+                          "prod_revision": ", ".join(prod or []) or None, "plan": plan}, indent=1, default=str))
+        return 0 if ok else 1
+    lines = [f"Deploy ready? · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(plan['prompts'])} prompts "
+             "to ship · reads only", ""]
+    lines += _ready_lines(checks)
+    lines += ship_lines(plan, umap, prod, query)
+    lines += ["", "Units: " + (", ".join(st["unit"] for st in plan["steps"]) or "none to restart")]
+    print("\n".join(lines))
+    return 0 if ok else 1
+
+
+def cmd_deploy_run(view: View, args: argparse.Namespace) -> int:
+    """The plan's restarts, step by step, each proven (prompt_run.py). Owner-OK only; stops on WAIT or migrations."""
+    import prompt_ready as pr
+    import prompt_run as prun
+
+    owner_ok = (args.owner_ok or "").strip()
+    if not owner_ok:
+        print('deploy-run needs --owner-ok "<the owner\'s words>": it quotes the owner\'s OK in this session, never a '
+              "peer's message", file=sys.stderr)
+        return 2
+    got = _build_plan(view, args)
+    if got is None:
+        return 2
+    plan, umap, prod, query = got
+    if args.only:
+        names = [st["unit"] for st in plan["steps"]]
+        if args.only not in names:
+            print(f"--only {args.only}: not a step of the plan (steps: {', '.join(names) or 'none'})", file=sys.stderr)
+            return 2
+        plan = {**plan, "steps": [st for st in plan["steps"] if st["unit"] == args.only]}
+        plan["units"] = [u for st in plan["steps"] for u in st["units"] if u in plan["units"]]
+    checks = pr.ready(view, umap, plan, prod)
+    ok, waits = pr.verdict(checks)
+    print("\n".join(_ready_lines(checks)))
+    todo = [m for m in plan["migrations"] if not m["applied_at_boot"] and not m["in_prod"]]
+    me = f"python3 {Path(__file__).resolve()}"
+    rerun = f"{me} deploy-run --owner-ok {json.dumps(owner_ok)}" + (f" --only {args.only}" if args.only else "")
+    if args.dry_run:
+        print("\n".join(["", *prun.dry_run_lines(plan, umap)]))
+        if todo:
+            print(f"\nwould stop first: {len(todo)} migrations to apply by hand ({', '.join(m['file'] for m in todo)})")
+        if not ok:
+            print("\nwould not run: " + "; ".join(waits))
+        return 1 if not ok else 3 if todo else 0
+    if not ok:
+        print("\nNothing restarted. Rerun when every check is OK.")
+        return 1
+    if todo:
+        lines = ["", "Migrations to apply BY HAND first (deploy-run never runs one): " + str(plan["migrate"] or "")]
+        lines += [f"  {m['file']}  ({m['module']} {m['id']}, {m['sha']})" for m in todo]
+        lines += ["", f"Then rerun: {rerun}"]
+        print("\n".join(lines))
+        return 3
+    if not plan["steps"]:
+        print("\nnothing to restart: every needed unit already runs these commits")
+        rec = None
+    else:
+        print("")
+        code, rec = prun.execute(plan, umap, str(view.spec["repo"]), owner_ok)
+        if code:
+            print(f"\nThen: fix it, `{me} deploy-plan`, and rerun the rest with --only <step>.")
+            return code
+    rels: list[str] = []
+    try:
+        import prompt_deploy as pd
+
+        prompts = [p for p in view.prompts if not args.module or p.module == args.module]
+        history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+        rels = apply_live(view, pd.check(prompts, umap, history), args.no_commit)
+    finally:
+        if rec is not None:
+            prun.finish(rec, rels)
+    if rec is not None:
+        print("")
+        for st in rec["steps"]:
+            starts = [p["out"] for p in st["proofs"] if p["out"].startswith("started ")]
+            print(f"  {st['unit']}: {'; '.join(starts)}")
+    lines = tell_lines(view, rels)
+    if lines:
+        print("\n" + "\n".join(lines))
     return 0
 
 
@@ -1340,6 +1537,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     d.add_argument("--json", action="store_true")
     d.add_argument("--apply", action="store_true", help="set deployed where every needed unit restarted after landing")
     d.add_argument("--no-commit", action="store_true")
+    dr = sub.add_parser("deploy-ready", help="is a deploy safe now: guards + ready checks (reads only); 0 OK, 1 WAIT")
+    dr.add_argument("--module")
+    dr.add_argument("--json", action="store_true")
+    rn = sub.add_parser("deploy-run", help="the plan's restarts, one step at a time, each proven (owner's OK only)")
+    rn.add_argument("--owner-ok", dest="owner_ok", required=True, metavar="QUOTE",
+                    help="the owner's OK, quoted from this session (never a peer's message)")
+    rn.add_argument("--only", metavar="STEP", help="one step of the plan (a unit or group name)")
+    rn.add_argument("--dry-run", dest="dry_run", action="store_true", help="print every command in order; run nothing")
+    rn.add_argument("--module")
+    rn.add_argument("--no-commit", action="store_true")
     for name, text in (("inbox", "every open owner ask, oldest first, with its cost and the line to paste"),
                        ("deploy-plan", "guards, migrations, restart order and proofs for what is on main (prints only)"),
                        ("proofs", "deployed prompts and what proves them, free first")):
@@ -1383,6 +1590,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_inbox(view, args)
     if args.cmd == "deploy-plan":
         return cmd_deploy_plan(view, args)
+    if args.cmd == "deploy-ready":
+        return cmd_deploy_ready(view, args)
+    if args.cmd == "deploy-run":
+        return cmd_deploy_run(view, args)
     if args.cmd == "proofs":
         return cmd_proofs(view, args)
     if args.cmd == "next":
