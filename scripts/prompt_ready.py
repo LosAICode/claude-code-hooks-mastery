@@ -11,6 +11,8 @@ memory, locks, merge state, dirty modules/, deploy-plan, unit start times). The 
 - ``migration_chain``: each migration to apply chains from prod's ``alembic_version`` or another shipped one, and
   the files have one head.
 - ``landing_window_min``: no other live session mid-commit into the repo, or landed code there in the window.
+
+Always: no prompt that would ship is held by the owner (``hold:`` in its frontmatter, ``command_center.py hold``).
 """
 
 from __future__ import annotations
@@ -194,12 +196,34 @@ def landing(sessions: list[dict[str, Any]], repo: str, now: float, window_min: f
     return _check("no session landing", not found, "; ".join(dict.fromkeys(found)))
 
 
+def hold_quote(meta: dict[str, Any]) -> str | None:
+    """The owner's words a prompt is held with (``hold: {owner, by, at}``, or a hand-written string), else None."""
+    h = meta.get("hold")
+    if not h:
+        return None
+    return str(h.get("owner") or "") if isinstance(h, dict) else str(h)
+
+
+def holds(view: Any, plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """One WAIT per held prompt the plan would ship (on main, its units waiting): CC10, the owner held A04b's
+    restart and only the conversation knew."""
+    by_rel = {p.rel: p for p in view.prompts}
+    out = []
+    for e in plan.get("prompts") or []:
+        p = by_rel.get(e["rel"])
+        quote = hold_quote(p.meta) if p is not None and e.get("waits") else None
+        if quote is not None:
+            label = f"{e['module']}/{e['id'] or e['name']}"
+            out.append(_check(f'{label} held by the owner ("{quote}")', False))
+    return out
+
+
 def ready(view: Any, umap: dict[str, Any], plan: dict[str, Any], prod: list[str] | None,
           run: Any = subprocess.run, meminfo: str | None = None) -> list[dict[str, Any]]:
     """[{name, ok, detail}]: the guards, then the ready checks the map turns on."""
     opt = options(umap)
     repo = str(view.spec["repo"])
-    out = guards(umap, plan, run)
+    out = guards(umap, plan, run) + holds(view, plan)
     if opt.get("min_available_mb"):
         out.append(memory(int(opt["min_available_mb"]), meminfo))
     out.append(locks([str(f) for f in opt.get("locks") or []], run))

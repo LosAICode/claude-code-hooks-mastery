@@ -38,6 +38,12 @@ _YAML_TYPED = re.compile(
 
 def _parse_value(raw: str) -> Any:
     raw = raw.strip()
+    if raw.startswith("{") and raw.endswith("}"):  # a one-line JSON mapping (``hold:``), which YAML reads alike
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return raw
+        return value if isinstance(value, dict) else raw
     if raw.startswith("[") and raw.endswith("]"):
         inner = raw[1:-1].strip()
         return [_parse_value(x) for x in inner.split(",")] if inner else []
@@ -72,6 +78,8 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str, bool]:
 
 
 def _dump_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_dump_value(v) for v in value) + "]"
     if value is None:

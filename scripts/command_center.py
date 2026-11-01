@@ -24,6 +24,11 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py proofs [--module M] [--json]       # deployed prompts and what proves them, free first
     python3 scripts/command_center.py next [--parallel] [--json]         # pending prompts that can start now, and why not the rest
     python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
+    python3 scripts/command_center.py hold <module/ID> --owner "<quote>" [--no-commit]  # deploy-ready WAITs, deploy-run refuses
+    python3 scripts/command_center.py unhold <module/ID> [--no-commit]
+    python3 scripts/command_center.py request <module/ID> [--note TEXT]   # a peer asks for a deploy, then messages /cc
+    python3 scripts/command_center.py requests [--all] [--json]           # the deploy requests (--all: done ones too)
+    python3 scripts/command_center.py deploy-ready --answer <request id>  # records the verdict on that request
 
 Config: the ``prompts`` block of the session tracker config (see docs/command-center.md).
 """
@@ -244,10 +249,12 @@ def render_terminal(view: View) -> str:
         lines += ["", deploy]
     if rows:
         lines += ["", "Sessions"] + [session_line(r) for r in rows]
+    lines += request_lines(view)
     sections = [
         ("Stalled (frontmatter says running, session gone)",
          [(m["module"], p, _last_run(view.runs_of(p), p)) for m in mods for p in m["stalled"]]),
-        ("Blocked on owner", [(m["module"], p, meta_str(p, "needs_owner") or meta_str(p, "notes")) for m in mods for p in m["blocked"]]),
+        ("Blocked on owner", blocked_rows(view, [(m["module"], p, meta_str(p, "needs_owner") or meta_str(p, "notes"))
+                                                for m in mods for p in m["blocked"]])),
         ("Parked (on-branch, no live session, unmoved 24 h+)",
          [(mod, p, f"tip {tip} · {age(secs)}") for mod, p, tip, secs in parked(view)]),
         ("Next up", [(m["module"], m["next"], f"⚑ needs owner: {owner}" if owner else "")
@@ -258,6 +265,41 @@ def render_terminal(view: View) -> str:
         if rows:
             lines += ["", title] + [_row(mod, p, tail) for mod, p, tail in rows]
     return "\n".join(lines)
+
+
+def blocked_rows(view: View, rows: list[tuple[str, pc.Prompt, str]]) -> list[tuple[str, pc.Prompt, str]]:
+    """The blocked prompts, plus every open prompt the owner holds, each with the owner's words (CC10)."""
+    import prompt_ready as pr
+
+    rows = list(rows)
+    at = {p.rel: i for i, (_, p, _) in enumerate(rows)}
+    for p in view.prompts:
+        quote = pr.hold_quote(p.meta)
+        if quote is None or p.status in pc.CLOSED:
+            continue
+        tail = f'held by the owner ("{quote}")'
+        if p.rel in at:
+            mod, q, was = rows[at[p.rel]]
+            rows[at[p.rel]] = (mod, q, f"{tail} · {was}" if was else tail)
+        else:
+            rows.append((p.module, p, tail))
+    return rows
+
+
+def request_lines(view: View) -> list[str]:
+    """The view's Inbox: open deploy requests, oldest first (CC10)."""
+    import prompt_requests as pq
+
+    rows = [r for r in pq.load() if r.get("state") == "open"]
+    if not rows:
+        return []
+    out = ["", f"Inbox: deploy requests ({len(rows)} open, oldest first; `deploy-ready --answer <id>` answers one)"]
+    for r in rows:
+        since = pc._parse_iso(r.get("ts"))
+        waited = f"{age(view.now - since)} ago" if since is not None else "?"
+        out.append(f"  {r['id']}  {str(r.get('prompt')):<22}{str(r.get('session') or '-')[:8]} · {waited}"
+                   + (f" · {r['note']}" if r.get("note") else ""))
+    return out
 
 
 def deploy_line(view: View) -> str | None:
@@ -771,6 +813,7 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
                 out.append(f"{p.module}/{p.id}: {ref[:9]} was rebased to {new[:9]}, which its commits already list")
             else:
                 out.append(f"{p.module}/{p.id}: {ref[:9]} was rebased to {new[:9]}: set {p.module}/{p.id} --commit {new[:9]}")
+    out += cross_prompt_findings(view, module)
     try:
         umap = pd.load_map(view.spec)
     except (OSError, ValueError):
@@ -810,6 +853,59 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
                     and folder.name == folder.name.lower() and any(folder.rglob("*.md"))):
                 out.append(f"lower-case module folder {folder.relative_to(Path(str(view.spec['repo'])))}/ "
                            "(module folders are capitalized; move its prompts with `set` or `sort`)")
+    return out
+
+
+_PROMPT_ID = re.compile(r"^[A-Z]+\d+[a-z]?(?:-\d+)?$")
+
+
+def commit_subjects(repo: str, shas: list[str]) -> dict[str, str]:
+    """{sha as listed: its subject}, one git call; a sha not in the repo is left out."""
+    shas = list(dict.fromkeys(shas))
+    if not shas:
+        return {}
+    try:
+        p = subprocess.run(["git", "-C", repo, "log", "--no-walk=unsorted", "--ignore-missing", "--format=%H%x09%s", *shas],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    full = [line.split("\t", 1) for line in (p.stdout or "").splitlines() if "\t" in line]
+    return {s: subject for s in shas for h, subject in full if h.startswith(s)}
+
+
+def names_prompt(subject: str, pid: str, module: str, aliases: dict[str, str], qualified: bool) -> bool:
+    """The subject names ``pid`` as a token (``A04b`` not in ``A04b-2`` or ``xA04b``); with ``qualified``, its module
+    (or an alias of it) is named too: a short id (``S3``, ``A1``) or one two modules share means nothing alone."""
+    if not re.search(rf"(?<![\w-]){re.escape(pid)}(?![\w-])", subject):
+        return False
+    if not qualified:
+        return True
+    names = [module] + [k for k, v in aliases.items() if str(v) == module and not _PROMPT_ID.match(k)]
+    return any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", subject, re.IGNORECASE) for n in names)
+
+
+def cross_prompt_findings(view: View, module: str | None = None) -> list[str]:
+    """A commit in a prompt's ``commits:`` whose subject names another prompt and not its own (CC10: M02's docs commit
+    280389595 sat in R9's list). Read-only: the fix is a hand edit of ``commits:``."""
+    aliases = dict(view.spec.get("module_aliases") or {})
+    index: dict[str, list[pc.Prompt]] = {}
+    for p in view.prompts:
+        if p.id and _PROMPT_ID.match(p.id) and p.status not in pc.NOT_COUNTED:
+            index.setdefault(p.id, []).append(p)
+    mine = [p for p in view.prompts if (not module or p.module == module) and p.id and pc.commits_of(p.meta)]
+    subjects = commit_subjects(str(view.spec["repo"]), [s for p in mine for s in pc.commits_of(p.meta)])
+    out = []
+    for p in mine:
+        for sha in pc.commits_of(p.meta):
+            subject = subjects.get(sha)
+            if not subject or names_prompt(subject, p.id, p.module, aliases, len(p.id) <= 2):
+                continue
+            for pid, qs in sorted(index.items()):
+                if pid.lower() == p.id.lower():
+                    continue
+                for q in qs:
+                    if names_prompt(subject, pid, q.module, aliases, len(pid) <= 2 or len(qs) > 1):
+                        out.append(f'{p.module}/{p.id}: {sha[:9]} "{fit(subject, 70)}" names {q.module}/{q.id}')
     return out
 
 
@@ -1353,29 +1449,38 @@ def _ready_lines(checks: list[dict[str, Any]]) -> list[str]:
 
     ok, waits = pr.verdict(checks)
     lines = [f"OK  {c['name']}" + (f" ({c['detail']})" if c["detail"] else "") if c["ok"] else
-             f"WAIT: {c['name']}: {c['detail']}" for c in checks]
+             f"WAIT: {c['name']}" + (f": {c['detail']}" if c["detail"] else "") for c in checks]
     return lines + ["", "Deploy: OK" if ok else f"Deploy: WAIT ({len(waits)} reasons)"]
 
 
 def cmd_deploy_ready(view: View, args: argparse.Namespace) -> int:
     """Is a deploy safe now: the guards and ready checks (all reads), then what would ship. 0 OK, 1 WAIT, 2 no map."""
     import prompt_ready as pr
+    import prompt_requests as pq
 
+    if args.answer and not any(r["id"] == args.answer for r in pq.load()):
+        print(f"--answer {args.answer}: no such deploy request (`requests --all` lists them)", file=sys.stderr)
+        return 2
     got = _build_plan(view, args)
     if got is None:
         return 2
     plan, umap, prod, query = got
     checks = pr.ready(view, umap, plan, prod)
     ok, waits = pr.verdict(checks)
+    answer = answer_request(view, args.answer, "OK" if ok else "WAIT: " + "; ".join(waits)) if args.answer else None
     if args.json:
         print(json.dumps({"now": _iso(view.now), "verdict": "OK" if ok else "WAIT", "waits": waits, "checks": checks,
-                          "prod_revision": ", ".join(prod or []) or None, "plan": plan}, indent=1, default=str))
+                          "prod_revision": ", ".join(prod or []) or None, "plan": plan,
+                          **({"answered": answer} if answer else {})}, indent=1, default=str))
         return 0 if ok else 1
     lines = [f"Deploy ready? · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(plan['prompts'])} prompts "
              "to ship · reads only", ""]
     lines += _ready_lines(checks)
     lines += ship_lines(plan, umap, prod, query)
     lines += ["", "Units: " + (", ".join(st["unit"] for st in plan["steps"]) or "none to restart")]
+    if answer:
+        lines += ["", f"request {answer['id']} answered: {answer['verdict']}"
+                  + (f" · tell {str(answer.get('session'))[:8]}" if answer.get("session") else "")]
     print("\n".join(lines))
     return 0 if ok else 1
 
@@ -1442,6 +1547,7 @@ def cmd_deploy_run(view: View, args: argparse.Namespace) -> int:
     finally:
         if rec is not None:
             prun.finish(rec, rels)
+    close_requests(view, rels, rec["id"] if rec else None)
     if rec is not None:
         print("")
         for st in rec["steps"]:
@@ -1485,6 +1591,108 @@ def cmd_next(view: View, args: argparse.Namespace) -> int:
         lines += ["", "no unit map: unit overlap not checked"]
     print("\n".join(lines))
     return 0
+
+
+# --- owner holds and deploy requests (CC10) ------------------------------------------------------------------
+
+
+def cmd_hold(view: View, args: argparse.Namespace) -> int:
+    """``hold``: write ``hold: {owner, by, at}``; ``unhold``: remove it. A status commit either way; the prompt's
+    deploy requests follow (open/answered → held, held → open)."""
+    import prompt_ready as pr
+    import prompt_requests as pq
+
+    holding = args.cmd == "hold"
+    quote = (args.owner or "").strip() if holding else ""
+    if holding and not quote:
+        print('hold needs --owner "<the owner\'s words>": it quotes the owner in this session, never a peer\'s message',
+              file=sys.stderr)
+        return 2
+    try:
+        p = find_prompt(view, args.ref)
+    except LookupError as e:
+        print(e, file=sys.stderr)
+        return 2
+    if not holding and pr.hold_quote(p.meta) is None:
+        print(f"{p.module} {p.id or p.name} is not held", file=sys.stderr)
+        return 2
+    value = {"owner": quote, "by": pr.own_session() or "unknown", "at": _iso(view.now)} if holding else None
+    with pc._PromptLock(pc._lock_dir(view.spec), p.rel):
+        written = pc.write_meta(p.path, {"hold": value})
+    if written is None:
+        print(f"{p.rel} changed while writing; not written (run it again)", file=sys.stderr)
+        return 2
+    ref = f"{p.module}/{p.id or p.name}"
+    states, to = (("open", "answered"), "held") if holding else (("held",), "open")
+    moved = pq.update(lambda r: r.get("prompt") == ref and r.get("state") in states, {"state": to})
+    print(f'{p.module} {p.id or p.name}: ' + (f'held by the owner ("{quote}")' if holding else "unheld")
+          + (f"; {len(moved)} deploy requests → {to}" if moved else ""))
+    commit_change(view, [p.module], [p.rel], f"docs(prompts): {p.module} {p.id or p.name} "
+                  + ("held by the owner" if holding else "unheld"), args.no_commit)
+    return 0
+
+
+def cmd_request(view: View, args: argparse.Namespace) -> int:
+    import prompt_ready as pr
+    import prompt_requests as pq
+
+    try:
+        p = find_prompt(view, args.ref)
+    except LookupError as e:
+        print(e, file=sys.stderr)
+        return 2
+    row = pq.add(f"{p.module}/{p.id or p.name}", args.note, pr.own_session(), view.now)
+    quote = pr.hold_quote(p.meta)
+    if quote is not None:
+        row = pq.update(lambda r: r["id"] == row["id"], {"state": "held"})[0]
+    print(f"request {row['id']}: {row['prompt']} ({p.status}) {row['state']}"
+          + (f'; held by the owner ("{quote}")' if quote is not None else ""))
+    print(f'Now SendMessage the /cc session: "deploy request {row["id"]} ({row["prompt"]})"')
+    return 0
+
+
+def cmd_requests(view: View, args: argparse.Namespace) -> int:
+    import prompt_requests as pq
+
+    rows = [r for r in pq.load() if args.all or r.get("state") not in pq.CLOSED]
+    if args.json:
+        print(json.dumps({"now": _iso(view.now), "requests": rows}, indent=1, default=str))
+        return 0
+    lines = [f"Deploy requests · {datetime.fromtimestamp(view.now).strftime('%Y-%m-%d %H:%M')} · {len(rows)}"
+             + (" (all)" if args.all else " not done") + ", oldest first"]
+    for r in rows:
+        tail = [x for x in (r.get("note"), r.get("verdict") and f"answered: {r['verdict']}",
+                            r.get("deploy") and f"deploy {r['deploy']}") if x]
+        lines.append(f"  {r['id']}  {str(r.get('state')):<9}{str(r.get('prompt')):<22}{str(r.get('session') or '-')[:8]}"
+                     f" · {r.get('ts')}" + "".join(f" · {x}" for x in tail))
+    print("\n".join(lines if rows else lines + ["  none"]))
+    return 0
+
+
+def answer_request(view: View, rid: str, verdict: str) -> dict[str, Any] | None:
+    """deploy-ready's verdict on one request: open/answered → answered; a held or done one keeps its state."""
+    import prompt_ready as pr
+    import prompt_requests as pq
+
+    got = pq.update(lambda r: r["id"] == rid, {"verdict": verdict, "answered_at": _iso(view.now),
+                                                "answered_by": pr.own_session()})
+    if got and got[0].get("state") in ("open", "answered"):
+        got = pq.update(lambda r: r["id"] == rid, {"state": "answered"})
+    return got[0] if got else None
+
+
+def close_requests(view: View, rels: list[str], deploy_id: str | None) -> None:
+    """deploy-run: every request for a prompt it set deployed → done, with the deploy's id."""
+    import prompt_requests as pq
+
+    by_rel = {p.rel: p for p in view.prompts}
+    refs = {f"{p.module}/{p.id or p.name}" for p in (by_rel.get(r) for r in rels) if p is not None}
+    if not refs:
+        return
+    done = pq.update(lambda r: r.get("prompt") in refs and r.get("state") not in pq.CLOSED,
+                     {"state": "done", "deploy": deploy_id, "done_at": _iso(time.time())})
+    if done:
+        print(f"deploy requests done: {', '.join(r['id'] + ' (' + str(r['prompt']) + ')' for r in done)}")
 
 
 # --- main ------------------------------------------------------------------------------------------------
@@ -1540,6 +1748,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     dr = sub.add_parser("deploy-ready", help="is a deploy safe now: guards + ready checks (reads only); 0 OK, 1 WAIT")
     dr.add_argument("--module")
     dr.add_argument("--json", action="store_true")
+    dr.add_argument("--answer", metavar="REQUEST_ID", help="record the verdict on that deploy request")
     rn = sub.add_parser("deploy-run", help="the plan's restarts, one step at a time, each proven (owner's OK only)")
     rn.add_argument("--owner-ok", dest="owner_ok", required=True, metavar="QUOTE",
                     help="the owner's OK, quoted from this session (never a peer's message)")
@@ -1556,6 +1765,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     nx = sub.add_parser("next", help="pending prompts that can start now (deps done, no run-last, no overlap)")
     nx.add_argument("--parallel", action="store_true", help="every startable prompt, not just the first per module")
     nx.add_argument("--json", action="store_true")
+    ho = sub.add_parser("hold", help="the owner holds a prompt: deploy-ready WAITs on it, deploy-run refuses it")
+    ho.add_argument("ref", help="module/ID, ID or file name")
+    ho.add_argument("--owner", required=True, metavar="QUOTE", help="the owner's words, quoted from this session")
+    ho.add_argument("--no-commit", action="store_true")
+    uh = sub.add_parser("unhold", help="remove the owner's hold (only on the owner's word)")
+    uh.add_argument("ref", help="module/ID, ID or file name")
+    uh.add_argument("--no-commit", action="store_true")
+    rq = sub.add_parser("request", help="ask the /cc session for a deploy of a prompt (then SendMessage it)")
+    rq.add_argument("ref", help="module/ID, ID or file name")
+    rq.add_argument("--note", help="what you need (units, timing)")
+    rs = sub.add_parser("requests", help="the deploy requests: open, answered, held (--all: done too)")
+    rs.add_argument("--all", action="store_true")
+    rs.add_argument("--json", action="store_true")
     so = sub.add_parser("sort", help="file every prompt under its module's Completed/ or Pending/ folder")
     so.add_argument("--dry-run", action="store_true")
     so.add_argument("--no-commit", action="store_true")
@@ -1606,6 +1828,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_board_check(view, args)
     if args.cmd == "board-markers":
         return cmd_board_markers(view, args)
+    if args.cmd in ("hold", "unhold"):
+        return cmd_hold(view, args)
+    if args.cmd == "request":
+        return cmd_request(view, args)
+    if args.cmd == "requests":
+        return cmd_requests(view, args)
     if args.board:
         changed, notes = regenerate(view)
         repo = Path(str(view.spec["repo"]))
