@@ -325,6 +325,13 @@ the command then says so and the next run catches up. `board-check` ignores the 
   it names is down (an outage restart is never stopped; `restart_web.sh` names the three web units). An error reading
   `systemctl is-active` lets it through (logged). Otherwise: "Ask the Command Center: send `deploy request
   <module>/<ID>` to the /cc session; it answers with `deploy-ready`."
+- **Verify gate** (owner 11-01, on whenever `board_gate.repo` is set). The same restarts, plus
+  `command_center.py deploy-run` without `--dry-run` (it restarts units from Python, out of the hook's sight), are
+  stopped while a `board_gate.code_paths` file changed on `board_gate.branch` since the newest record in
+  `deploys/verified.jsonl` that the repo has. `/verify` ends with `scripts/verify_record.py --summary "<result>"`, which
+  records the branch tip. The message names the files and the `git diff <sha>..main -- modules/` to verify. A down
+  unit and `NEUROGEN_VERIFY_OVERRIDE="<reason>"` (logged with `kind: verify`) always pass; a hook error lets the call
+  through (logged). Seeded 11-01 with a BASELINE record at `771071574` (main as live since the 07:43 restart).
 - **Gate.** With `prompts.gate` on, a Stop is blocked once per session when the session claimed a prompt, has commits
   or deploys, and the prompt is still `running` under its id. The message names the `set` command. It never blocks a
   session that only stopped to ask a question (no commits), and a read error lets the stop through (logged).

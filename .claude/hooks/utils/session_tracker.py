@@ -863,11 +863,12 @@ def _deploy_open(run_id: str) -> bool:
     return isinstance(meta, dict) and "end" not in meta
 
 
-def _log_override(session_id: str, reason: str, match: str) -> None:
+def _log_override(session_id: str, reason: str, match: str, kind: str = "deploy") -> None:
     d = tracker_dir() / "deploys"
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "overrides.jsonl", "a") as f:
-        f.write(json.dumps({"ts": now_iso(), "session_id": session_id, "reason": reason, "match": match}) + "\n")
+        f.write(json.dumps({"ts": now_iso(), "session_id": session_id, "reason": reason, "match": match,
+                            "kind": kind}) + "\n")
 
 
 def restart_gate(payload: dict[str, Any], cfg: dict[str, Any],
@@ -916,6 +917,118 @@ def restart_gate(payload: dict[str, Any], cfg: dict[str, Any],
         return None
     except Exception as e:
         log_error("restart_gate", e)
+        return None
+
+
+# --- verify gate (owner 11-01) --------------------------------------------------------------------
+
+VERIFY_RECORD = "verified.jsonl"
+VERIFY_BLOCK_REASON = (
+    "BLOCKED: no /verify covers what this restart ships ({why}). Run /verify on main's code since the last "
+    "verified restart, then record it: python3 /opt/claude-code-hooks-mastery/scripts/verify_record.py "
+    "--summary \"<verify result>\". (Outage: a unit that is down can always be restarted; override: "
+    "NEUROGEN_VERIFY_OVERRIDE=\"<reason>\", logged.)"
+)
+
+
+def record_verify(sha: str, summary: str, session_id: str = "") -> dict[str, Any]:
+    """Append one /verify record: the sha of main it covers. The verify gate reads the newest ones."""
+    rec = {"ts": now_iso(), "session_id": session_id, "sha": sha, "summary": summary}
+    d = tracker_dir() / "deploys"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / VERIFY_RECORD, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return rec
+
+
+def _verify_records(limit: int = 20) -> list[dict[str, Any]]:
+    try:
+        with open(tracker_dir() / "deploys" / VERIFY_RECORD) as f:
+            lines = f.read().splitlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):  # newest first
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and re.fullmatch(r"[0-9a-f]{7,40}", str(rec.get("sha") or "")):
+            out.append(rec)
+    return out
+
+
+def _deploy_run(run: list[str]) -> bool:
+    """`command_center.py deploy-run` without --dry-run: it restarts units itself, out of this hook's sight."""
+    for i, w in enumerate(run[:3]):
+        if w.endswith("command_center.py") and run[i + 1:i + 2] == ["deploy-run"]:
+            return "--dry-run" not in run
+    return False
+
+
+def _unverified_code(repo: str, branch: str, paths: list[str], git: GitRunner) -> str | None:
+    """None when the newest verify record covers the code on `branch`, else why not."""
+    records = _verify_records()
+    if not records:
+        return "no verify recorded yet"
+    for rec in records:
+        rc, _ = git(repo, "merge-base", "--is-ancestor", rec["sha"], branch, ok_codes=(0, 1, 128))
+        if rc != 0:
+            continue  # a branch sha, or one this repo doesn't have
+        _, out = git(repo, "diff", "--name-only", rec["sha"], branch, "--", *paths)
+        changed = out.split()
+        if not changed:
+            return None
+        more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
+        return (f"code changed on {branch} since the verify of {rec['sha'][:9]}: {', '.join(changed[:3])}{more}; "
+                f"what to verify: git -C {repo} diff {rec['sha'][:9]}..{branch} -- {' '.join(paths)}")
+    return f"no verify record is on {branch}"
+
+
+def verify_gate(payload: dict[str, Any], cfg: dict[str, Any], is_active: Callable[[str], str] = _systemctl_is_active,
+                git: GitRunner = run_git) -> str | None:
+    """PreToolUse Bash: the block message for a restart that ships code no /verify has covered, else None.
+
+    Off unless ``board_gate.repo`` is set. A restart is ``restart_patterns`` (default: restart_web.sh, systemctl
+    restart/stop/start neurogenserver*) at the command word, or ``command_center.py deploy-run`` without
+    --dry-run. It passes while no ``board_gate.code_paths`` file changed on the branch since the newest
+    ``deploys/verified.jsonl`` record on it (scripts/verify_record.py, the last step of /verify). Always allowed:
+    an outage (every unit it names is down) and ``NEUROGEN_VERIFY_OVERRIDE=<reason>`` (logged). Never raises.
+    """
+    try:
+        gate = cfg.get("board_gate")
+        repo = str(gate.get("repo") or "") if isinstance(gate, dict) else ""
+        if not repo:
+            return None
+        command = str((payload.get("tool_input") or {}).get("command") or "")
+        patterns = list(cfg.get("restart_patterns") or DEFAULT_RESTART_PATTERNS)
+        sid = str(payload.get("session_id") or "")
+        for seg in _segments(command):
+            for run in _executed(seg):
+                match = deploy_matches(" ".join(run), patterns)
+                if not match and not _deploy_run(run):
+                    continue
+                env = {}
+                for w in seg:  # the assignments before the command word (a `bash -c` run has none in seg)
+                    if w == run[0]:
+                        break
+                    if _ENV_ASSIGN.match(w):
+                        k, v = w.split("=", 1)
+                        env[k] = v
+                if env.get("NEUROGEN_VERIFY_OVERRIDE", "").strip():
+                    _log_override(sid, env["NEUROGEN_VERIFY_OVERRIDE"].strip(), (match or ["deploy-run"])[0],
+                                  kind="verify")
+                    continue
+                units = _restart_units(run) if match else []
+                if units and all(is_active(u) != "active" for u in units):
+                    continue  # an outage: nothing live to ship over
+                why = _unverified_code(repo, str(gate.get("branch") or "main"),
+                                       list(gate.get("code_paths") or []), git)
+                if why:
+                    return VERIFY_BLOCK_REASON.format(why=why)
+        return None
+    except Exception as e:
+        log_error("verify_gate", e)
         return None
 
 
