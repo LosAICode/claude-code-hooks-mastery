@@ -640,7 +640,8 @@ def tests_value(p: pc.Prompt, args: argparse.Namespace) -> str | None | bool:
     except OSError:  # live 11-01: a long text was stat'ed as a file name (ENAMETOOLONG)
         is_file = False
     if not is_file:
-        if len(args.tests) < 256 and ("/" in args.tests or path.suffix in (".txt", ".json")):
+        looks_like_path = not re.search(r"\s", args.tests) and len(args.tests) < 256
+        if looks_like_path and ("/" in args.tests or path.suffix in (".txt", ".json")):
             print(f"--tests refused: {args.tests} is not a file", file=sys.stderr)  # a missing results file
             return False
         return f"{args.tests[:300]} · {sha[:9]}"

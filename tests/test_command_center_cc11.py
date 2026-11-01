@@ -195,6 +195,9 @@ def test_set_tests_takes_long_text_as_text(two, capsys):
     stored = meta_of(r / "docs/Prompts/ops/Ops-CC9-X.md")["tests"]
     assert stored.startswith(text[:300]) and text[:301] not in stored
     assert stored.endswith(" · " + s["h2"][:7])
+    # text with slashes is still text (live 11-01: "23/23 files … TZ=America/New_York" was refused as a missing file)
+    assert run("set", "ops/CC9", "on-main", "--tests", "23/23 files pass under TZ=America/New_York", "--no-commit") == 0
+    assert run("set", "ops/CC9", "on-main", "--tests", "/no/such/results.txt", "--no-commit") == 2
 
 
 @pytest.fixture(autouse=True)
