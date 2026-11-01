@@ -30,7 +30,7 @@ import prompt_plan as pp
 MEMINFO = "/proc/meminfo"
 FREEZE_FILE = "/run/lock/neurogen-deploy-freeze"
 DEFAULTS = {"min_available_mb": 1500, "locks": [], "merge_state": True, "dirty_units": True, "migration_chain": True,
-            "landing_window_min": 10, "main_line": True}
+            "landing_window_min": 10, "main_line": True, "verify": True}
 STATUS_COMMIT_PREFIX = "docs(prompts):"  # command_center.py's own commits: they change no unit
 
 
@@ -223,6 +223,19 @@ def main_line(repo: str, root: str, now: float, branch: str = "main", days: floa
     return _check("main line", not bad, ml.line_text(bad[0]) if bad else "")
 
 
+def verify(cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """WAIT while no /verify record covers main's code: the verify gate would block the restart (CC12; Assistants 2
+    asked, 11-01). None while the gate is off (no ``board_gate.repo``)."""
+    import session_tracker as st
+
+    gate = (st.load_config() if cfg is None else cfg).get("board_gate")
+    repo = str(gate.get("repo") or "") if isinstance(gate, dict) else ""
+    if not repo:
+        return None
+    why = st._unverified_code(repo, str(gate.get("branch") or "main"), list(gate.get("code_paths") or []), st.run_git)
+    return _check("verify", not why, why or "")
+
+
 def hold_quote(meta: dict[str, Any]) -> str | None:
     """The owner's words a prompt is held with (``hold: {owner, by, at}``, or a hand-written string), else None."""
     h = meta.get("hold")
@@ -264,6 +277,8 @@ def ready(view: Any, umap: dict[str, Any], plan: dict[str, Any], prod: list[str]
     if opt.get("main_line"):
         out.append(main_line(repo, str(view.spec.get("root") or ""), view.now,
                              str(view.spec.get("main_branch") or "main"), float(view.spec.get("main_line_days") or 3)))
+    if opt.get("verify"):
+        out += [c for c in [verify()] if c]
     if opt.get("landing_window_min"):
         out.append(landing(view.sessions, repo, view.now, float(opt["landing_window_min"]), own_session(), also, umap))
     return out

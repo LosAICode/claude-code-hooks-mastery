@@ -11,12 +11,13 @@ are read with ``systemctl show`` (read-only: nothing here restarts anything).
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import prompt_center as pc
 
@@ -117,9 +118,33 @@ class History:
         self.others = list(others or [])
         out = self._git("log", "--first-parent", "--format=%H %ct", branch) or ""
         rows = [line.split() for line in out.splitlines() if line]
-        self.first_parent = {sha: int(ct) for sha, ct in rows}
         self.position = {sha: i for i, (sha, _) in enumerate(rows)}  # 0 = main's tip; higher = older
+        reached = self._reached()
+        self.first_parent = {sha: max(int(ct), reached(self.position[sha]) or 0) for sha, ct in rows}
         self._resolved: dict[str, str | None] = {}
+
+    def _reached(self) -> Callable[[int], int | None]:
+        """position → the earliest time main's reflog held a tip at or above it, else None (CC12, live 11-01: R3
+        merged main into its branch and main fast-forwarded at 08:58, so `6ba6cc1e1` sat on the first-parent line
+        with its 10-30 23:15 committer date, and every unit "started after it landed")."""
+        ref = self.branch if self.branch.startswith("refs/") else f"refs/heads/{self.branch}"
+        out = self._git("reflog", "show", "--date=unix", "--format=%H %gd", ref) or ""
+        seen = []
+        for line in out.splitlines():
+            m = re.match(r"([0-9a-f]{40}) \S*@\{(\d+)\}$", line.strip())
+            if m and m.group(1) in self.position:  # an old tip no longer on the line says nothing about it
+                seen.append((self.position[m.group(1)], int(m.group(2))))
+        seen.sort()
+        tops, earliest, low = [], [], None
+        for pos, t in seen:
+            low = t if low is None else min(low, t)
+            tops.append(pos)
+            earliest.append(low)
+
+        def at(position: int) -> int | None:
+            i = bisect.bisect_right(tops, position)
+            return earliest[i - 1] if i else None
+        return at
 
     def _git(self, *args: str) -> str | None:
         try:

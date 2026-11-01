@@ -179,10 +179,24 @@ def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.Hist
 
     files = migration_files(repo, mig_dir) if prod and repo and mig_dir else {}
     applied = applied_revisions(files, prod) if files else set()
-    migrations = [{"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f, "applied_at_boot": booted(e, c),
-                   "in_prod": revision_of(files.get(f, ""))[0] in applied if applied else False}
-                  for e in picked for c in e["commits"] if not c.get("repo") for f in c.get("files") or []
-                  if mig_dir and f.startswith(mig_dir + "/")]
+    # one row per file, from the newest commit that touched it (CC12, live 11-01: R3's migration read as "to apply"
+    # from one commit and "ran at boot" from another); with prod read, alembic_version decides and the boot guess
+    # only stands in when it can't be read
+    by_file: dict[str, dict[str, Any]] = {}
+    for e in picked:
+        for c in e["commits"]:
+            if c.get("repo"):
+                continue
+            for f in c.get("files") or []:
+                if not (mig_dir and f.startswith(mig_dir + "/")):
+                    continue
+                old = by_file.get(f)
+                if old is None or c["landed"] >= old["landed"]:
+                    in_prod = revision_of(files.get(f, ""))[0] in applied if applied else False
+                    by_file[f] = {"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f,
+                                  "applied_at_boot": False if prod else booted(e, c), "in_prod": in_prod,
+                                  "landed": c["landed"]}
+    migrations = [{k: v for k, v in m.items() if k != "landed"} for m in by_file.values()]
     restart, ready = dep.get("restart") or {}, dep.get("ready") or {}
     order = list(dep.get("order") or pd.compact(list(umap.get("order") or []), umap))
     order += [u for u in sorted(units) if u not in {m for n in order for m in groups.get(n, [n])}]
