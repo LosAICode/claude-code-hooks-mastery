@@ -79,6 +79,8 @@ python3 scripts/command_center.py board-markers [--no-commit]   # once: a genera
 python3 scripts/command_center.py sort [--dry-run] [--no-commit]   # file every prompt under Completed/ or Pending/
 python3 scripts/command_center.py inbox [--module M] [--json]        # every open owner ask, longest waiting first
 python3 scripts/command_center.py deploy-plan [--module M] [--json]  # guards, migrations, restart order, proofs: prints, runs nothing
+python3 scripts/command_center.py deploy-ready [--module M] [--json] # OK or WAIT with every reason, and what would ship; exit 0/1
+python3 scripts/command_center.py deploy-run --owner-ok "<the owner's words>" [--only STEP] [--dry-run] [--no-commit]
 python3 scripts/command_center.py proofs [--module M] [--json]       # deployed prompts and what proves them, free first
 python3 scripts/command_center.py next [--parallel] [--json]         # pending prompts that can start now, and why the rest wait
 python3 scripts/command_center.py migrate [--module M] [--dry-run] [--force]
@@ -161,7 +163,46 @@ with the guards that must hold right before it (`before:`, e.g. 0 live calls bef
 | `restart` | `{group or unit: command, "*": "systemctl restart {unit}"}` |
 | `proof`, `ready`, `after_each` | per unit (`{unit}` filled in); `{unit: its ready-line grep}`; after every step (health ×3) |
 
+| `lock`, `freeze_file`, `proof_wait_s` | `deploy-run`'s lock (default `/run/lock/neurogen-aa-deploy.lock`); the freeze file the `/cc` line checks (default `/run/lock/neurogen-deploy-freeze`); how long a unit's start-time and ready-line proofs poll (default 120 s) |
+| `ready_checks` | `deploy-ready`'s own checks: `min_available_mb` (default 1500), `locks` (files that must not be held, e.g. the sandbox lock; default none), `merge_state`, `dirty_units`, `migration_chain` (booleans, default on), `landing_window_min` (default 10) |
+
 Without a `deploy` block it uses the map's own unit order and plain `systemctl restart`, with a note.
+
+**Rebased commits** (CC9). A sha in `commits:` that is not on main (the commit before a rebase, which the hook
+recorded: R9's `0fa179e48`, 10-31) resolves to the main commit with the same `git patch-id`, else the same subject and
+author. `deploy-check` and `deploy-plan` use the new sha and print `<old> → <new> (rebased)`; a resolved sha the prompt
+already lists counts once. `audit` gives the `set … --commit <new>` line; nothing rewrites `commits:` on its own.
+
+**`deploy-ready`** (CC9, read-only) is the answer to "is a deploy safe?". It runs every `deploy.guards` entry (a
+`before:` guard only when its unit ships) and the `ready_checks`: free memory (`MemAvailable`) at or above the floor;
+no `locks` file held (`flock -n`; a suite in the sandbox); no merge or rebase in progress in the live tree; no
+uncommitted change the unit map maps to a unit or that is live at merge (static JS); every migration to apply chains
+from prod's `alembic_version` or another shipped migration, with one head (prod unread = WAIT); no other live session
+landing now (a pending git commit/merge snapshot in the repo, or a code commit recorded within `landing_window_min`;
+the calling session and `docs(prompts):` status commits are skipped). One line per check (`OK  <name>` or
+`WAIT: <name>: <detail>`), the verdict `Deploy: OK` / `Deploy: WAIT (<n> reasons)`, then what would ship (prompts,
+units, migrations to apply, not proven tested). Exit 0 OK, 1 WAIT, 2 unit map unreadable.
+
+**`deploy-run`** (CC9) is the one command that acts, run from the `/cc` session after the owner's OK, quoted in
+`--owner-ok` (never a peer session's message). It refuses without the quote and when `deploy-ready` says WAIT; with
+migrations to apply it prints `deploy.migrate` and the files and exits 3 (apply them by hand, then rerun; it never
+runs a migration). Under the deploy lock (held elsewhere = exit 1) it runs each step of `deploy-plan` as its own
+process with `NEUROGEN_DEPLOY_RUN=<id>` (a step's own `flock <lock>` prefix dropped: it already holds that lock), then
+that step's proofs as separate reads: every member unit's `ActiveEnterTimestamp` at or after the step began, its ready
+line (newer than the step when it carries a timestamp), and `after_each` (`/api/health` ×3, all 200). A failed command
+or proof stops it: it prints what is live and what is not, and `--only <step>` reruns one step. At the end it runs
+`deploy-check --apply` and prints the `Tell:` lines. `--dry-run` prints every command in order and runs nothing (exit 1
+on WAIT, 3 when migrations would stop it).
+
+Each run writes `~/.claude/session-tracker/deploys/<id>.json` after every step: the owner's OK, the session, the plan,
+per step its start, end, commands with exit codes and proofs with their output, the result and the prompts set
+deployed. A file with no `end` is a run in progress (the restart gate below reads exactly that). `/cc` shows one line:
+`Deploy: OK | WAIT (<first reason>) · last deploy <age>`, from the cheap checks only (freeze file, locks, merge state,
+memory: no psql, no systemctl).
+
+**`Tell:`**. After `deploy-run`, and after `deploy-check --apply` alone, one line per prompt set deployed:
+`Tell: <session> · <module>/<ID> · owes: <its proof>` (`(no live session)` when its session ended). The `/cc` session
+sends them with SendMessage; the script cannot.
 
 **`proofs`** lists `deployed` prompts (live, proof open) with their `proof:` line, else the first top-level bullet
 under `## Done when` that says "live". Ranked by `cost` + `proof`: free ("session tokens only", "no AI credits",
@@ -230,7 +271,22 @@ the command then says so and the next run catches up. `board-check` ignores the 
   claim is found through `_moved.json`), then committed with a pathspec as `docs(prompts): <module> <ID> commits +<sha>`
   when `commit_claims` is on. Skipped: status commits (`docs(prompts):`), commits touching only the prompts tree, and
   commits in other repos (deploy-check reads only the prompts repo; a hooks-repo prompt still uses `set --commit`).
-  A failure is logged, never raised.
+  A failure is logged, never raised. Only what this session's command could make counts (CC9; live 10-31: M02's docs
+  commit `280389595` landed in the shared tree while Connections ran `command_center.py set` and was credited to R9): a
+  `command_center.py` call makes only status commits; `git commit -m <msg>` (also `-am`, `--message=`, a
+  `$(cat <<'EOF' …)` heredoc) makes a commit with that subject, and with a `--` pathspec only files under those paths;
+  merge, cherry-pick, revert, am and `-F` have no subject rule. A commit whose `Claude-Session:` trailer belongs to
+  another live session is skipped; a session learns its own trailer from its first subject-matched commit. Rejected
+  commits go to the session's `skipped_commits` (last 20, with the reason). A command that only mentions `git commit`
+  (in an echo or a grep) records nothing.
+- **Restart gate** (CC9, off until `prompts.deploy_coordinator` is set). A PreToolUse Bash hook stops
+  `scripts/restart_web.sh` and `systemctl restart|stop|start neurogenserver*` at the command word (top-level `restart_patterns`, beside `deploy_patterns`),
+  so `systemctl show`/`status`/`is-active` and a mention in an argument pass. It lets the call through when the session
+  is the coordinator; when the restart's own segment sets `NEUROGEN_DEPLOY_RUN=<id>` and `deploys/<id>.json` has no
+  `end`; when it sets `NEUROGEN_DEPLOY_OVERRIDE="<reason>"` (appended to `deploys/overrides.jsonl`); or when every unit
+  it names is down (an outage restart is never stopped; `restart_web.sh` names the three web units). An error reading
+  `systemctl is-active` lets it through (logged). Otherwise: "Ask the Command Center: send `deploy request
+  <module>/<ID>` to the /cc session; it answers with `deploy-ready`."
 - **Gate.** With `prompts.gate` on, a Stop is blocked once per session when the session claimed a prompt, has commits
   or deploys, and the prompt is still `running` under its id. The message names the `set` command. It never blocks a
   session that only stopped to ask a question (no commits), and a read error lets the stop through (logged).
@@ -259,6 +315,7 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `sync_lock`, `sync_every_hours` | an auto-commit daemon's lock file and cadence; `migrate` refuses to run near it |
 | `unit_map`, `main_branch` | `deploy-check`: the project's path → unit map (repo-relative JSON) and the branch it lands on (default `main`) |
 | `status_board` | `board-check`: the hand-written Status Board (repo-relative) |
+| `deploy_coordinator` | `{"session": "<id or ≥8-char prefix>"}`: the `/cc` session whose restarts pass the restart gate; unset = the gate is off |
 | `prod_revision` | `deploy-plan`: a read-only shell query printing prod's `alembic_version` head(s), e.g. `psql -h 127.0.0.1 -U postgres -d neurogenserver -tAc 'SELECT version_num FROM alembic_version'`; unset = "alembic_version unread" |
 
 ## Migration
