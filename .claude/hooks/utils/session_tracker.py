@@ -32,6 +32,7 @@ MAX_DEPLOYS = 100
 MAX_COMMITS_PER_COMMAND = 20
 MAX_SKIPPED_COMMITS = 20
 PENDING_MAX_AGE_S = 3600
+OPEN_AGENT_MAX_AGE_S = 6 * 3600  # a subagent whose SubagentStop never arrived stops holding the Stop gate after this
 LOG_MAX_BYTES = 1_000_000
 
 DEFAULT_BLOCK_REASON = (
@@ -725,6 +726,25 @@ def apply_event(
     elif event == "SessionEnd":
         _set_state(data, "ended")
         data["end_reason"] = payload.get("reason")
+    elif event in ("SubagentStart", "SubagentStop"):
+        _on_subagent(data, event, str(payload.get("agent_id") or ""))
+
+
+def _on_subagent(data: dict[str, Any], event: str, agent_id: str) -> None:
+    """Keep ``open_agents`` {agent_id: started} for the parent session (both events carry the parent's session_id).
+    A stop with no start (compaction's summariser) is a no-op; expired entries are dropped on every event."""
+    agents = {a: ts for a, ts in (data.get("open_agents") or {}).items() if a in open_agents(data)}
+    if agent_id and event == "SubagentStart":
+        agents[agent_id] = now_iso()
+    elif agent_id:
+        agents.pop(agent_id, None)
+    data["open_agents"] = agents
+
+
+def open_agents(session: dict[str, Any] | None) -> list[str]:
+    """Subagents started and not yet stopped, younger than OPEN_AGENT_MAX_AGE_S."""
+    cutoff = time.time() - OPEN_AGENT_MAX_AGE_S
+    return [a for a, ts in ((session or {}).get("open_agents") or {}).items() if (parse_iso(ts) or 0) > cutoff]
 
 
 def _claim_prompt(data: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> None:
@@ -957,6 +977,8 @@ def prompt_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None, 
         return None
     if session.get("prompt_gate_blocked") or not session.get("prompt_claimed") or not session.get("prompt_file"):
         return None
+    if open_agents(session):  # CC10: background agents still working; ask when they are done, not mid-work
+        return None
     if not session.get("commits") and not session.get("deploys"):
         return None
     import importlib
@@ -988,7 +1010,7 @@ def progress_gate_reason(payload: dict[str, Any], session: dict[str, Any] | None
         return None
     if session.get("progress_gate_blocked") or not session.get("prompt_gate_blocked"):
         return None
-    if not session.get("prompt_claimed") or not session.get("prompt_file"):
+    if not session.get("prompt_claimed") or not session.get("prompt_file") or open_agents(session):
         return None
     import importlib
 

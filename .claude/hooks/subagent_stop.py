@@ -50,6 +50,13 @@ except ImportError:
         pass
 
 try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
+try:
     from utils.llm.task_summarizer import summarize_subagent_task
 except ImportError:
     # Fallback if imports fail
@@ -202,6 +209,7 @@ def main() -> None:
 
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
+        track("SubagentStop", input_data)  # closes the parent session's open agent (CC10)
 
         # Extract required fields (used for logging context)
         _ = input_data.get("session_id", "")

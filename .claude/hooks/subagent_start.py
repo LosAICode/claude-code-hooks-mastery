@@ -20,6 +20,13 @@ try:
 except ImportError:
     pass  # dotenv is optional
 
+try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
 
 def debug_log(message: str) -> None:
     """Write debug message to logs/subagent_debug.log"""
@@ -102,6 +109,7 @@ def main() -> None:
 
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
+        track("SubagentStart", input_data)  # opens an agent on the parent session: the Stop gate waits (CC10)
 
         # Extract fields for logging/announcement (only extract what we use)
         agent_id = input_data.get("agent_id", "unknown")
