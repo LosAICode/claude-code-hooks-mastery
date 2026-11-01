@@ -189,3 +189,23 @@ def test_apply_leaves_a_prompt_another_session_moved_since_the_scan(deploy, monk
     assert run("deploy-check", "--apply") == 0
     assert "status: done" in a10.read_text() and "deployed:" not in a10.read_text()
     assert "agents A10: left alone" in capsys.readouterr().out
+
+
+def test_a_main_commit_after_main_was_merged_into_a_branch_needs_only_its_own_files(deploy, capsys):
+    """Live 11-01 00:48: A03 merged main into a03_widget and main fast-forwarded to it, so CC9's map-only commit
+    left the first-parent line and was charged every file the branch changed since its fork (web, celery, ...)."""
+    r = deploy
+    git(r, "checkout", "-q", "-b", "side", "HEAD~1")
+    commit_file(r, "modules/side.py", "s", "side: code", when="2026-10-30T14:10:00")
+    git(r, "checkout", "-q", "main")
+    map_sha = commit_file(r, "scripts/other.json", "{}", "map only", when="2026-10-30T14:20:00")
+    (r / "docs/Prompts/agents/Agents-A14-X.md").write_text(f"---\nstatus: on-main\ncommit: \"{map_sha[:9]}\"\n---\n# A14: x\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-q", "-m", "prompt A14", env={"GIT_AUTHOR_DATE": "2026-10-30T14:21:00", "GIT_COMMITTER_DATE": "2026-10-30T14:21:00"})
+    git(r, "checkout", "-q", "side")
+    git(r, "merge", "-q", "--no-ff", "main", "-m", "Merge branch 'main' into side")
+    git(r, "checkout", "-q", "main")
+    git(r, "merge", "-q", "--ff-only", "side")
+    a14 = results(capsys)["A14"]
+    assert a14["commits"][0]["files"] == ["scripts/other.json"]
+    assert a14["state"] == "no-unit" and a14["needs"] == []

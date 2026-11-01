@@ -141,7 +141,12 @@ class History:
                 return None, f"{ref}: no landing commit found on {self.branch}"
             merge = max(merges, key=self.position.__getitem__)
             landed = self.first_parent[merge]
-            base = (self._git("merge-base", f"{merge}^1", full) or "").strip()
+            # a merge named by sha stands for its branch; a plain commit is only its own change (live 11-01: A03
+            # merged main into its branch and main fast-forwarded, so main's own commits came in as "branch" ones
+            # and were charged every file the branch changed since its fork)
+            merged = len((self._git("rev-list", "--parents", "-n", "1", full) or "").split()) > 2
+            base = ((self._git("merge-base", f"{merge}^1", full) if merged
+                     else self._git("rev-parse", "--verify", "--quiet", f"{full}^1")) or "").strip()
         raw = (self._git("diff", "-z", "--name-only", "--no-renames", base, full) if base
                else self._git("show", "-z", "--name-only", "--format=", full))
         if raw is None:  # an empty list would read as "no unit needed"
