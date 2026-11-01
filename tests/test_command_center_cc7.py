@@ -79,7 +79,7 @@ def test_a_broken_prompt_center_never_breaks_commit_tracking(hooked, monkeypatch
     st.track("UserPromptSubmit", {"session_id": SID, "cwd": str(cwd), "prompt": f"run {REL}"})
     monkeypatch.setattr(pc, "add_commits", lambda *a, **k: 1 / 0)
     bash = {"session_id": SID, "cwd": str(cwd), "tool_name": "Bash", "tool_use_id": "t1",
-            "tool_input": {"command": f"git -C {r} commit -m x"}}
+            "tool_input": {"command": f"git -C {r} commit -m 'feat: a'"}}
     st.track("PreToolUse", bash)
     sha = commit_file(r, "modules/a.py", "a", "feat: a")
     st.track("PostToolUse", bash)
@@ -224,7 +224,7 @@ def gated(tmp_path, tracker_env):
 
 def _commit_in_session(r, msg, tid):
     bash = {"session_id": SID, "cwd": str(r), "tool_name": "Bash", "tool_use_id": tid,
-            "tool_input": {"command": f"git -C {r} commit -m x"}}
+            "tool_input": {"command": f"git -C {r} commit -m '{msg}'"}}  # CC9: the subject must match
     st.track("PreToolUse", bash)
     commit_file(r, f"modules/{tid}.py", tid, msg)
     st.track("PostToolUse", bash)

@@ -30,6 +30,7 @@ HIDE_ENDED_AFTER_S = 24 * 3600
 MAX_COMMITS = 200
 MAX_DEPLOYS = 100
 MAX_COMMITS_PER_COMMAND = 20
+MAX_SKIPPED_COMMITS = 20
 PENDING_MAX_AGE_S = 3600
 LOG_MAX_BYTES = 1_000_000
 
@@ -50,6 +51,11 @@ _GIT_SUBCMD = re.compile(
     r"\bgit\s+(?:-C\s+(\S+)\s+|-c\s+\S+\s+)*(commit|merge|cherry-pick|revert|am)\b"
 )
 _COMMAND_CENTER = re.compile(r"\bcommand_center\.py\b")
+_COMMITTING = ("commit", "merge", "cherry-pick", "revert", "am")
+_HEREDOC_MESSAGE = re.compile(
+    r"(?:-m|--message)[=\s]+[\"']?\$\(\s*cat\s*<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\s*\2[ \t]*(?=\n|\)|$)", re.S
+)
+SESSION_TRAILER = "Claude-Session"
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?(?:\n\s*\2[ \t]*(?=\n|$)|\Z)", re.S)
 _SEPARATOR_CHARS = set(";&|()")
 _SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}
@@ -379,6 +385,7 @@ def _refresh_branch(data: dict[str, Any], git: GitRunner) -> None:
 def _on_bash(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str, Any], git: GitRunner) -> None:
     command = str((payload.get("tool_input") or {}).get("command") or "")
     cwd = str(payload.get("cwd") or data.get("last_cwd") or "")
+    expect = _expected(command, cwd, data.get("worktree"), cfg)  # the worktree as PreToolUse saw it
     moved = worktree_from_command(command, cwd)
     if moved and moved != data.get("worktree") and os.path.isdir(moved):
         try:  # only a git checkout counts as a worktree (`cd /tmp` does not)
@@ -393,8 +400,10 @@ def _on_bash(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str, Any],
 
     pending = (data.get("pending_heads") or {}).pop(_pending_key(payload, command), None)
     made = []
-    for git_dir, before in ((pending or {}).get("heads") or {}).items():
-        made += _record_commits(data, git_dir, before, git)
+    if pending and pending.get("heads"):
+        others = _other_live_trailers(data)
+        for git_dir, before in pending["heads"].items():
+            made += _record_commits(data, git_dir, before, git, expect.get(git_dir, []), others)
     if made and data.get("prompt_claimed") and data.get("prompt_file"):
         try:
             _credit_prompt(data, made, cfg, git)
@@ -432,30 +441,212 @@ def _snapshot_heads(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str
         data["pending_heads"] = pending
 
 
-def _record_commits(data: dict[str, Any], git_dir: str, before: str, git: GitRunner) -> list[dict[str, Any]]:
-    """Credit the commits HEAD moved through during this command (first parent, oldest first); none if it did not move.
+def _git_target(words: list[str], cur: str) -> tuple[str, str, list[str]] | None:
+    """(dir, subcommand, its args) of a committing `git` run, else None."""
+    if not words or os.path.basename(words[0]) != "git":
+        return None
+    i, git_dir = 1, cur
+    while i < len(words) and words[i].startswith("-"):
+        if words[i] in ("-C", "-c") and i + 1 < len(words):
+            if words[i] == "-C":
+                git_dir = _resolve(words[i + 1], git_dir)
+            i += 2
+        else:
+            i += 1
+    if i >= len(words) or words[i] not in _COMMITTING:
+        return None
+    return os.path.normpath(git_dir), words[i], words[i + 1:]
+
+
+def _first_paragraph(message: str) -> str:
+    """git's %s: the message's first paragraph, its lines joined by spaces (a newline reaches us as " ; ")."""
+    lines = []
+    for line in message.replace(" ; ", "\n").splitlines():
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line.strip())
+    return " ".join(lines)
+
+
+def _commit_rule(args: list[str], heredocs: list[str]) -> dict[str, Any]:
+    """What one `git commit` can make: {"subject": first -m's subject or None, "paths": its pathspec or None}."""
+    message: str | None = None
+    unparsable = False
+    paths = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            paths = args[i + 1:]
+            break
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        value = None
+        if a == "--message" or a.startswith("--message="):
+            value, i = (a.split("=", 1)[1], i) if "=" in a else (nxt, i + 1)
+        elif a in ("--file", "-F", "-C", "-c", "--reuse-message", "--reedit-message") or a.startswith(
+                ("--file=", "--reuse-message=", "--reedit-message=")):
+            unparsable = True  # the message comes from a file or another commit
+            i += 0 if "=" in a else 1
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch == "m":
+                    value, i = (a[k + 1:], i) if a[k + 1:] else (nxt, i + 1)
+                    break
+                if ch in "FCc":
+                    unparsable = True
+                    i += 0 if a[k + 1:] else 1
+                    break
+        if value is not None and message is None:
+            message = value
+        i += 1
+    subject = None
+    if message is not None and not unparsable:
+        if "$(" in message:
+            message = heredocs.pop(0) if heredocs else None
+        if message is not None and "$" not in message and "`" not in message:
+            subject = _first_paragraph(message) or None
+    return {"subject": subject, "paths": paths}
+
+
+def _expected(command: str, cwd: str, worktree: str | None, cfg: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Per repo dir, what this command can make: one rule per committing word it executes (CC9).
+
+    A rule is {"status": True} (command_center.py: its own status commits only), {"subject", "paths"} (a `git
+    commit`: the first -m's subject, the pathspec after `--`; None = no such rule) or {} (merge, cherry-pick,
+    revert, am, a message from a file: what it brings in). A commit is this command's when one rule of its dir
+    accepts it. Live 10-31: Security M02's docs commit landed in the shared tree while Connections ran `command_center
+    .py set connections/R9`, and the bare before/after snapshot put it in R9's ``commits:``."""
+    rules: dict[str, list[dict[str, Any]]] = {}
+    heredocs = [_first_paragraph(m.group(3).replace("\n", " ; ")) for m in _HEREDOC_MESSAGE.finditer(command)]
+    cur = worktree or cwd
+    spec = cfg.get("prompts")
+    for seg in _segments(command):
+        for run in _executed(seg):
+            if run[0] == "cd" and len(run) > 1 and run[1] not in ("-", "~-"):
+                cur = _resolve(run[1], cur)
+                continue
+            if isinstance(spec, dict) and spec.get("repo") and any(
+                    os.path.basename(w) == "command_center.py" for w in run[:2]):
+                rules.setdefault(os.path.normpath(str(spec["repo"])), []).append({"status": True})
+                continue
+            target = _git_target(run, cur)
+            if not target:
+                continue
+            git_dir, sub, args = target
+            rule = _commit_rule(args, heredocs) if sub == "commit" else {}
+            if rule.get("paths") is not None:
+                rule["paths"] = [_resolve(p, git_dir) for p in rule["paths"]]
+            rules.setdefault(git_dir, []).append(rule)
+    return rules
+
+
+def _covered(files: list[str], paths: list[str], top: str) -> bool:
+    """Every file (repo-relative) lies under one of the pathspec's absolute paths (a directory covers its files)."""
+    import fnmatch
+
+    def ok(f: str) -> bool:
+        full = os.path.join(top, f)
+        return any(full == p or full.startswith(p.rstrip("/") + "/") or fnmatch.fnmatchcase(full, p) for p in paths)
+
+    return bool(files) and all(ok(f) for f in files)
+
+
+def _accepts(rule: dict[str, Any], subject: str, files: Callable[[], list[str]], top: Callable[[], str]) -> bool:
+    if rule.get("status"):
+        return _is_status_commit(subject)
+    if rule.get("subject") is not None and subject != rule["subject"]:
+        return False
+    return rule.get("paths") is None or _covered(files(), rule["paths"], top())
+
+
+def _other_live_trailers(data: dict[str, Any]) -> set[str]:
+    """The Claude-Session trailers of the other live sessions (not ended, seen within STALE_AFTER_S)."""
+    out = set()
+    try:
+        for f in tracker_dir().glob("*.json"):
+            try:
+                other = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(other, dict) or other.get("session_id") == data.get("session_id"):
+                continue
+            seen = parse_iso(other.get("last_seen"))
+            if other.get("claude_session") and other.get("state") != "ended" and seen and \
+                    time.time() - seen < STALE_AFTER_S:
+                out.add(str(other["claude_session"]))
+    except OSError as e:
+        log_error("live_trailers", e)
+    out.discard(str(data.get("claude_session") or ""))
+    return out
+
+
+def _trailer(body: str) -> str:
+    found = re.findall(rf"^{SESSION_TRAILER}:\s*(\S+)\s*$", body, re.M)
+    return found[-1] if found else ""
+
+
+def _record_commits(data: dict[str, Any], git_dir: str, before: str, git: GitRunner,
+                    rules: list[dict[str, Any]] | None = None, others: set[str] | None = None) -> list[dict[str, Any]]:
+    """Credit the commits HEAD moved through during this command (first parent, oldest first) that the command
+    could have made (``_expected``); none if it did not move. A commit whose Claude-Session trailer is another live
+    session's is that session's. The rest go to ``skipped_commits`` with the reason.
 
     Returns the rows it added."""
     try:
         _, after = git(git_dir, "rev-parse", "HEAD")
         if after == before:
             return []
-        _, out = git(git_dir, "log", "--first-parent", f"-{MAX_COMMITS_PER_COMMAND}", "--format=%H%x00%s",
+        _, out = git(git_dir, "log", "--first-parent", f"-{MAX_COMMITS_PER_COMMAND}", "--format=%H%x00%s%x00%B%x1e",
                      f"{before}..{after}")
         rid = repo_id(git_dir, git)
     except GitError as e:
         log_error("commit", e)
         return []
-    rows = [line.split("\x00", 1) for line in reversed(out.splitlines()) if "\x00" in line]
+    rows = [rec.strip("\n").split("\x00", 2) for rec in out.split("\x1e") if rec.count("\x00") >= 2]
     commits = data.get("commits") or []
     known = {c.get("sha") for c in commits}
-    added = []
-    for sha, subject in rows:
+    added, skipped = [], []
+    top_cache: list[str] = []
+
+    def top() -> str:
+        if not top_cache:
+            top_cache.append(git(git_dir, "rev-parse", "--show-toplevel")[1])
+        return top_cache[0]
+
+    for sha, subject, body in reversed(rows):
         if sha in known:
+            continue
+        trailer = _trailer(body)
+        files_cache: list[list[str]] = []
+
+        def files(sha: str = sha) -> list[str]:
+            if not files_cache:
+                files_cache.append(_changed_files(git_dir, sha, git))
+            return files_cache[0]
+
+        reason = None
+        if trailer and trailer in (others or set()):
+            reason = "another live session's commit"
+        else:
+            try:
+                hit = next((r for r in rules or [] if _accepts(r, subject, files, top)), None)
+            except GitError as e:
+                log_error("commit_rule", e)
+                hit = None
+            if hit is None:
+                reason = "not made by this command"
+            elif hit.get("subject") is not None and trailer and not data.get("claude_session"):
+                data["claude_session"] = trailer
+        if reason:
+            skipped.append({"sha": sha, "subject": subject[:80], "reason": reason, "ts": now_iso()})
             continue
         added.append({"sha": sha, "subject": subject[:80], "repo": rid, "dir": git_dir, "ts": now_iso()})
         data["last_commit"] = f"{sha[:9]} {subject[:60]}"
     data["commits"] = (commits + added)[-MAX_COMMITS:]
+    if skipped:
+        data["skipped_commits"] = ((data.get("skipped_commits") or []) + skipped)[-MAX_SKIPPED_COMMITS:]
     if os.path.normpath(git_dir) == os.path.normpath(data.get("worktree") or ""):
         _refresh_branch(data, git)
     return added
@@ -608,6 +799,104 @@ def track(event: str, payload: dict[str, Any]) -> None:
             write_session(data)
     except Exception as e:
         log_error(f"track {event}", e)
+
+
+# --- restart gate (CC9) -------------------------------------------------------------------------
+
+DEFAULT_RESTART_PATTERNS = [r"scripts/restart_web\.sh", r"systemctl\s+(?:try-)?(?:restart|stop|start)\s+neurogenserver"]
+WEB_UNITS = ["neurogenserver", "neurogenserver-web@5027", "neurogenserver-web@5028"]
+RESTART_BLOCK_REASON = (
+    "BLOCKED: restarts are coordinated by the Command Center. Ask the Command Center: send `deploy request "
+    "<module>/<ID>` to the /cc session; it answers with `deploy-ready`. (Outage: a unit that is down can always be "
+    "restarted; override: NEUROGEN_DEPLOY_OVERRIDE=\"<reason>\", logged.)"
+)
+_DEPLOY_ID = re.compile(r"^[\w.-]+$")
+
+
+def _systemctl_is_active(unit: str) -> str:
+    import subprocess
+
+    try:
+        return subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        log_error("restart_gate is-active", e)
+        return "unknown"
+
+
+def _restart_units(run: list[str]) -> list[str]:
+    """The neurogenserver units a matched run acts on; [] when it can't tell (a `$u` in the name)."""
+    if os.path.basename(run[0]) != "systemctl":
+        return list(WEB_UNITS) if any(w.endswith("restart_web.sh") for w in run[:2]) else []
+    names = [w for w in run[1:] if not w.startswith("-")][1:]  # the words after the verb
+    units = [w.removesuffix(".service") for w in names if w.startswith("neurogenserver")]
+    return [] if any("$" in u for u in units) else units
+
+
+def _deploy_open(run_id: str) -> bool:
+    if not _DEPLOY_ID.match(run_id) or run_id.startswith("."):
+        return False
+    try:
+        with open(tracker_dir() / "deploys" / f"{run_id}.json") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and "end" not in meta
+
+
+def _log_override(session_id: str, reason: str, match: str) -> None:
+    d = tracker_dir() / "deploys"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "overrides.jsonl", "a") as f:
+        f.write(json.dumps({"ts": now_iso(), "session_id": session_id, "reason": reason, "match": match}) + "\n")
+
+
+def restart_gate(payload: dict[str, Any], cfg: dict[str, Any],
+                 is_active: Callable[[str], str] = _systemctl_is_active) -> str | None:
+    """PreToolUse Bash: the block message for a restart that skips the Command Center, else None. Never raises.
+
+    Off unless ``prompts.deploy_coordinator.session`` names a session (id or a prefix of 8+). Allowed: the
+    coordinator; ``NEUROGEN_DEPLOY_RUN=<id>`` on the restart with ``deploys/<id>.json`` still open (deploy-run);
+    ``NEUROGEN_DEPLOY_OVERRIDE=<reason>`` on it (logged to ``deploys/overrides.jsonl``); an outage (no unit it names
+    is active). Before CC9 any session could restart a unit, and every restart ships all of main (10-31 01:14: an
+    auto-restart shipped untested main during the freeze)."""
+    try:
+        spec = cfg.get("prompts")
+        coord = spec.get("deploy_coordinator") if isinstance(spec, dict) else None
+        coord_sid = str(coord.get("session") or "") if isinstance(coord, dict) else ""
+        if len(coord_sid) < 8:
+            return None
+        command = str((payload.get("tool_input") or {}).get("command") or "")
+        patterns = list(cfg.get("restart_patterns") or DEFAULT_RESTART_PATTERNS)
+        if not deploy_matches(command, patterns):
+            return None
+        sid = str(payload.get("session_id") or "")
+        if sid.startswith(coord_sid):
+            return None
+        for seg in _segments(command):
+            for run in _executed(seg):
+                match = deploy_matches(" ".join(run), patterns)
+                if not match:
+                    continue
+                env = {}
+                for w in seg:
+                    if w == run[0]:
+                        break
+                    if _ENV_ASSIGN.match(w):
+                        k, v = w.split("=", 1)
+                        env[k] = v
+                if env.get("NEUROGEN_DEPLOY_RUN") and _deploy_open(env["NEUROGEN_DEPLOY_RUN"]):
+                    continue
+                if env.get("NEUROGEN_DEPLOY_OVERRIDE", "").strip():
+                    _log_override(sid, env["NEUROGEN_DEPLOY_OVERRIDE"].strip(), match[0])
+                    continue
+                units = _restart_units(run)
+                if units and all(is_active(u) != "active" for u in units):
+                    continue  # an outage: the unit is down, restarting it can't ship anything over a live one
+                return RESTART_BLOCK_REASON
+        return None
+    except Exception as e:
+        log_error("restart_gate", e)
+        return None
 
 
 # --- Stop gate ------------------------------------------------------------------------------------

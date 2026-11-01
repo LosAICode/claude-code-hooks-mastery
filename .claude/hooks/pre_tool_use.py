@@ -15,6 +15,11 @@ except Exception:  # the session tracker must never break this hook
     def track(event, payload):
         return None
 
+try:
+    from session_tracker import load_config, restart_gate
+except Exception:  # no gate rather than a broken hook
+    restart_gate = None
+
 def is_dangerous_rm_command(command):
     """
     Comprehensive detection of dangerous rm commands.
@@ -116,6 +121,14 @@ def main():
         tool_input = input_data.get('tool_input', {})
         if tool_name in ('AskUserQuestion', 'Bash'):  # Bash: HEAD snapshot, so only its own commits count
             track("PreToolUse", input_data)
+        if tool_name == 'Bash' and restart_gate is not None:  # restarts are requested from the /cc session (CC9)
+            try:
+                reason = restart_gate(input_data, load_config())
+            except Exception:
+                reason = None
+            if reason:
+                print(reason, file=sys.stderr)
+                sys.exit(2)
         
         # Check for .env file access (blocks access to sensitive environment files)
         if is_env_file_access(tool_name, tool_input):
