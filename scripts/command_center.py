@@ -635,11 +635,15 @@ def tests_value(p: pc.Prompt, args: argparse.Namespace) -> str | None | bool:
         print(f"--tests: {p.module} {p.id or p.name} names no commit; pass --tested <sha> (or --commit)", file=sys.stderr)
         return False
     path = Path(args.tests).expanduser()
-    if not path.is_file():
-        if "/" in args.tests or path.suffix in (".txt", ".json"):  # a results file that isn't there is no verdict
-            print(f"--tests refused: {args.tests} is not a file", file=sys.stderr)
+    try:
+        is_file = path.is_file()
+    except OSError:  # live 11-01: a long text was stat'ed as a file name (ENAMETOOLONG)
+        is_file = False
+    if not is_file:
+        if len(args.tests) < 256 and ("/" in args.tests or path.suffix in (".txt", ".json")):
+            print(f"--tests refused: {args.tests} is not a file", file=sys.stderr)  # a missing results file
             return False
-        return f"{args.tests} · {sha[:9]}"
+        return f"{args.tests[:300]} · {sha[:9]}"
     summary, why = pp.read_verdict(path)
     if summary is None:
         print(f"--tests refused: {why}", file=sys.stderr)
@@ -800,7 +804,7 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
         if raw == "deployed" and not pp.proof_row(p)["proof"]:
             out.append(f"{pi.label(p)}: deployed with no proof (no `proof:` line, no live bullet under Done when), "
                        "so `proofs` can't say how to close it")
-    history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+    history = pd.history_for(view.spec)
     for p in prompts:
         if str(p.meta.get("status") or "") not in ("on-main", "deployed", "done") or not p.id:
             continue
@@ -815,6 +819,12 @@ def audit_findings(view: View, module: str | None = None) -> list[str]:
             else:
                 out.append(f"{p.module}/{p.id}: {ref[:9]} was rebased to {new[:9]}: set {p.module}/{p.id} --commit {new[:9]}")
     out += cross_prompt_findings(view, module)
+    if not module:
+        import prompt_mainline as ml
+
+        days = float(view.spec.get("main_line_days") or 3)
+        out += [ml.line_text(f) for f in ml.findings(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"),
+                                                     view.now - days * 86400)]
     try:
         umap = pd.load_map(view.spec)
     except (OSError, ValueError):
@@ -892,26 +902,56 @@ def names_prompt(subject: str, pid: str, module: str, aliases: dict[str, str], q
     return any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", subject, re.IGNORECASE) for n in names)
 
 
+_SCOPE = re.compile(r"^\w+\(([^)]+)\)!?:")
+
+
+def aliases_of(p: pc.Prompt, prompts: list[pc.Prompt]) -> set[str]:
+    """Ids that name this prompt too: its ``aliases:`` and any prompt of its module listing one of its commits
+    (connections ``01`` and ``C1`` are one audit, both list ``01071ccc7``)."""
+    raw = p.meta.get("aliases") or []
+    out = {str(a).lower() for a in (raw if isinstance(raw, list) else str(raw).replace(",", " ").split())}
+    mine = set(pc.commits_of(p.meta))
+    for q in prompts:
+        if q is not p and q.id and q.module == p.module and mine & set(pc.commits_of(q.meta)):
+            out.add(q.id.lower())
+    return out
+
+
 def cross_prompt_findings(view: View, module: str | None = None) -> list[str]:
     """A commit in a prompt's ``commits:`` whose subject names another prompt and not its own (CC10: M02's docs commit
-    280389595 sat in R9's list). Read-only: the fix is a hand edit of ``commits:``."""
+    280389595 sat in R9's list). Read-only: the fix is a hand edit of ``commits:``.
+
+    Not a hit (CC11): a merge (``Merge <branch>`` names the branch), the prompt's own base id (``A04`` for ``A04b``),
+    one of its aliases, or a prompt of its own module when the subject's scope is that module (A03's
+    ``test(assistants): … A01's payer check``)."""
     aliases = dict(view.spec.get("module_aliases") or {})
     index: dict[str, list[pc.Prompt]] = {}
     for p in view.prompts:
         if p.id and _PROMPT_ID.match(p.id) and p.status not in pc.NOT_COUNTED:
             index.setdefault(p.id, []).append(p)
     mine = [p for p in view.prompts if (not module or p.module == module) and p.id and pc.commits_of(p.meta)]
-    subjects = commit_subjects(str(view.spec["repo"]), [s for p in mine for s in pc.commits_of(p.meta)])
+    shas = [s for p in mine for s in pc.commits_of(p.meta)]
+    subjects = commit_subjects(str(view.spec["repo"]), shas)
+    for r in view.spec.get("repos") or []:
+        if isinstance(r, dict) and r.get("path"):
+            subjects = {**commit_subjects(str(r["path"]), [s for s in shas if s not in subjects]), **subjects}
     out = []
     for p in mine:
+        base = re.sub(r"[a-z]+$", "", p.id)
+        also = aliases_of(p, view.prompts)
         for sha in pc.commits_of(p.meta):
             subject = subjects.get(sha)
-            if not subject or names_prompt(subject, p.id, p.module, aliases, len(p.id) <= 2):
+            if not subject or subject.startswith("Merge ") or names_prompt(subject, p.id, p.module, aliases, len(p.id) <= 2):
                 continue
+            scope = _SCOPE.match(subject)
+            own_scope = bool(scope) and scope.group(1).lower() in {p.module.lower(), *(
+                str(k).lower() for k, v in aliases.items() if str(v) == p.module)}
             for pid, qs in sorted(index.items()):
-                if pid.lower() == p.id.lower():
+                if pid.lower() == p.id.lower() or pid == base or pid.lower() in also:
                     continue
                 for q in qs:
+                    if own_scope and q.module == p.module:
+                        continue
                     if names_prompt(subject, pid, q.module, aliases, len(pid) <= 2 or len(qs) > 1):
                         out.append(f'{p.module}/{p.id}: {sha[:9]} "{fit(subject, 70)}" names {q.module}/{q.id}')
     return out
@@ -1243,7 +1283,7 @@ def cmd_deploy_check(view: View, args: argparse.Namespace) -> int:
         print("no unit map: set prompts.unit_map in the tracker config (see docs/command-center.md)", file=sys.stderr)
         return 2
     prompts = [p for p in view.prompts if not args.module or p.module == args.module]
-    history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+    history = pd.history_for(view.spec)
     results = pd.check(prompts, umap, history)
     if args.json:
         print(json.dumps({"now": _iso(view.now), "units": {u: s for e in results for u, s in e["starts"].items()},
@@ -1403,7 +1443,7 @@ def _plan_inputs(view: View, args: argparse.Namespace) -> tuple[list[pc.Prompt],
         print("no unit map: set prompts.unit_map in the tracker config (see docs/command-center.md)", file=sys.stderr)
         return None
     prompts = [p for p in view.prompts if not args.module or p.module == args.module]
-    return prompts, umap, pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+    return prompts, umap, pd.history_for(view.spec)
 
 
 def _proof_line(r: dict[str, Any]) -> str:
@@ -1505,7 +1545,8 @@ def cmd_deploy_ready(view: View, args: argparse.Namespace) -> int:
     if got is None:
         return 2
     plan, umap, prod, query = got
-    checks = pr.ready(view, umap, plan, prod)
+    asker = next((r.get("session") for r in pq.load() if r["id"] == args.answer), None) if args.answer else None
+    checks = pr.ready(view, umap, plan, prod, also=[str(asker)] if asker else None)
     ok, waits = pr.verdict(checks)
     answer = answer_request(view, args.answer, "OK" if ok else "WAIT: " + "; ".join(waits)) if args.answer else None
     if args.json:
@@ -1582,7 +1623,7 @@ def cmd_deploy_run(view: View, args: argparse.Namespace) -> int:
         import prompt_deploy as pd
 
         prompts = [p for p in view.prompts if not args.module or p.module == args.module]
-        history = pd.History(str(view.spec["repo"]), str(view.spec.get("main_branch") or "main"))
+        history = pd.history_for(view.spec)
         rels = apply_live(view, pd.check(prompts, umap, history), args.no_commit)
     finally:
         if rec is not None:

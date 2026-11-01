@@ -30,7 +30,7 @@ import prompt_plan as pp
 MEMINFO = "/proc/meminfo"
 FREEZE_FILE = "/run/lock/neurogen-deploy-freeze"
 DEFAULTS = {"min_available_mb": 1500, "locks": [], "merge_state": True, "dirty_units": True, "migration_chain": True,
-            "landing_window_min": 10}
+            "landing_window_min": 10, "main_line": True}
 STATUS_COMMIT_PREFIX = "docs(prompts):"  # command_center.py's own commits: they change no unit
 
 
@@ -168,17 +168,35 @@ def migration_chain(plan: dict[str, Any], prod: list[str] | None, repo: str, uma
     return _check("migration chain", not problems, "; ".join(problems))
 
 
+def _needs_no_unit(repo: str, sha: str, umap: dict[str, Any] | None) -> bool:
+    """A commit whose files the map sends to no unit (tests, docs); unreadable or unknown = it may need one."""
+    if not umap:
+        return False
+    try:
+        p = subprocess.run(["git", "-C", repo, "show", "-z", "--name-only", "--format=", sha], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    files = [f for f in p.stdout.split("\0") if f.strip()] if p.returncode == 0 else []
+    return bool(files) and pd.needs(files, umap) == (set(), False)
+
+
 def landing(sessions: list[dict[str, Any]], repo: str, now: float, window_min: float,
-            own: str | None = None) -> dict[str, Any]:
+            own: str | None = None, also: list[str] | None = None,
+            umap: dict[str, Any] | None = None) -> dict[str, Any]:
     """Another live session committing into the repo now (a HEAD snapshot not yet closed), or landed code there in
-    the window (the tracker stores no commands: only the pending snapshot and the commit rows)."""
+    the window (the tracker stores no commands: only the pending snapshot and the commit rows).
+
+    Not counted (CC11, live 11-01 07:42: A03's request waited on its own one-file test commit): the sessions in
+    ``also`` (the request's own session) and, with the map, a commit that needs no unit."""
     target = os.path.normpath(repo)
     window = float(window_min) * 60
     found = []
     live = pc.live_session_ids(sessions, now)
+    skip = [x[:8] for x in [own, *(also or [])] if x]
     for s in sessions:
         sid = str(s["session_id"])
-        if sid not in live or (own and sid[:8] == own[:8]):  # its own deploy-ready call snapshots HEAD too
+        if sid not in live or sid[:8] in skip:  # its own deploy-ready call snapshots HEAD too
             continue
         who = str(s.get("name") or sid[:8])
         for snap in (s.get("pending_heads") or {}).values():
@@ -191,9 +209,18 @@ def landing(sessions: list[dict[str, Any]], repo: str, now: float, window_min: f
             if (when is None or os.path.normpath(str(c.get("dir") or "")) != target
                     or str(c.get("subject") or "").startswith(STATUS_COMMIT_PREFIX)):
                 continue
-            if 0 <= now - when <= window:
+            if 0 <= now - when <= window and not _needs_no_unit(repo, str(c.get("sha")), umap):
                 found.append(f"{who} landed {str(c.get('sha'))[:9]} {int((now - when) // 60)} min ago")
     return _check("no session landing", not found, "; ".join(dict.fromkeys(found)))
+
+
+def main_line(repo: str, root: str, now: float, branch: str = "main", days: float = 3) -> dict[str, Any]:
+    """WAIT while main's newest landing put a branch on its first-parent line (CC11: A03's fast-forward, 11-01)."""
+    import prompt_mainline as ml
+
+    found = ml.findings(repo, branch, now - float(days) * 86400)
+    bad = [f for f in found[:1] if ml.newest_landing(repo, f["sha"], root, branch)]
+    return _check("main line", not bad, ml.line_text(bad[0]) if bad else "")
 
 
 def hold_quote(meta: dict[str, Any]) -> str | None:
@@ -219,8 +246,9 @@ def holds(view: Any, plan: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def ready(view: Any, umap: dict[str, Any], plan: dict[str, Any], prod: list[str] | None,
-          run: Any = subprocess.run, meminfo: str | None = None) -> list[dict[str, Any]]:
-    """[{name, ok, detail}]: the guards, then the ready checks the map turns on."""
+          run: Any = subprocess.run, meminfo: str | None = None, also: list[str] | None = None) -> list[dict[str, Any]]:
+    """[{name, ok, detail}]: the guards, then the ready checks the map turns on. ``also``: sessions whose landings
+    don't count (the request being answered)."""
     opt = options(umap)
     repo = str(view.spec["repo"])
     out = guards(umap, plan, run) + holds(view, plan)
@@ -233,8 +261,11 @@ def ready(view: Any, umap: dict[str, Any], plan: dict[str, Any], prod: list[str]
         out.append(dirty_units(repo, umap, run))
     if opt.get("migration_chain"):
         out.append(migration_chain(plan, prod, repo, umap))
+    if opt.get("main_line"):
+        out.append(main_line(repo, str(view.spec.get("root") or ""), view.now,
+                             str(view.spec.get("main_branch") or "main"), float(view.spec.get("main_line_days") or 3)))
     if opt.get("landing_window_min"):
-        out.append(landing(view.sessions, repo, view.now, float(opt["landing_window_min"]), own_session()))
+        out.append(landing(view.sessions, repo, view.now, float(opt["landing_window_min"]), own_session(), also, umap))
     return out
 
 

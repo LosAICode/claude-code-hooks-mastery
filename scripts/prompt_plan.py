@@ -181,7 +181,7 @@ def deploy_plan(prompts: list[pc.Prompt], umap: dict[str, Any], history: pd.Hist
     applied = applied_revisions(files, prod) if files else set()
     migrations = [{"module": e["module"], "id": e["id"], "sha": c["sha"], "file": f, "applied_at_boot": booted(e, c),
                    "in_prod": revision_of(files.get(f, ""))[0] in applied if applied else False}
-                  for e in picked for c in e["commits"] for f in c.get("files") or []
+                  for e in picked for c in e["commits"] if not c.get("repo") for f in c.get("files") or []
                   if mig_dir and f.startswith(mig_dir + "/")]
     restart, ready = dep.get("restart") or {}, dep.get("ready") or {}
     order = list(dep.get("order") or pd.compact(list(umap.get("order") or []), umap))

@@ -36,6 +36,8 @@
     "unit_map": "scripts/deploy_units.json",
     "status_board": "docs/Status-Board.md",
     "main_branch": "main",
+    "repos": [{"name": "hooks", "path": "/path/to/hooks-repo", "live_at_merge": true}],
+    "main_line_days": 3,
     "prod_revision": "psql -h 127.0.0.1 -U postgres -d neurogenserver -tAc 'SELECT version_num FROM alembic_version'",
     "sync_lock": "/tmp/project-git-sync.lock",
     "sync_every_hours": 0,
