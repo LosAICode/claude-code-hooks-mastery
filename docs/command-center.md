@@ -125,7 +125,8 @@ session, a prompt another live session holds, and anything past `blocked` (a pro
 
 **`deploy-check`** answers "is it live?" per unit. For each `on-main` and `deployed` prompt it reads every commit in
 `commits:` (and the older `commit:`); it is live only when all of them are. It finds where each landed on main (the first first-parent commit that contains it: a branch commit lands at
-its merge, not at its author time), lists the files that landing brought, and maps them to units with the project's
+its merge, not at its author time), lists the files that landing brought (a merge named by its sha: its branch; a plain commit: only its own change, CC10, since
+live 11-01 a main merged into a branch and fast-forwarded put main's own commits off the first-parent line), and maps them to units with the project's
 map (`unit_map`; NeuroGenServer `scripts/deploy_units.json`, which `ops_drift.py` reads too: one map, owner decision
 10-30). A file needs the units of every rule it matches; a `live_at_merge` rule (static files) is live when it lands;
 a file no rule matches needs no unit. A unit counts when it started (`systemctl show`, read-only) after the latest
@@ -189,7 +190,8 @@ migrations to apply it prints `deploy.migrate` and the files and exits 3 (apply 
 runs a migration). Under the deploy lock (held elsewhere = exit 1) it runs each step of `deploy-plan` as its own
 process with `NEUROGEN_DEPLOY_RUN=<id>` (a step's own `flock <lock>` prefix dropped: it already holds that lock), then
 that step's proofs as separate reads: every member unit's `ActiveEnterTimestamp` at or after the step began, its ready
-line (newer than the step when it carries a timestamp), and `after_each` (`/api/health` ×3, all 200). A failed command
+line (newer than the step when it carries a timestamp; a local stamp in the hour a DST fall-back repeats reads as the
+later time, CC10), and `after_each` (`/api/health` ×3, all 200). A failed command
 or proof stops it: it prints what is live and what is not, and `--only <step>` reruns one step. At the end it runs
 `deploy-check --apply` and prints the `Tell:` lines. `--dry-run` prints every command in order and runs nothing (exit 1
 on WAIT, 3 when migrations would stop it).
@@ -239,6 +241,42 @@ reference`?): all report only, it never moves or deletes the owner's files; and 
   it (report only: the prompt's owner runs it). Status commits (`docs(prompts):`) and, with a unit map, commits that
   need no unit (docs, tests) are skipped: deploy-check would not miss them. Live 10-31: R4's fix `766d43595` was never
   recorded, so deploy-check called R4 live while the fix waited on web.
+- (CC10) `<module>/<ID>: <sha> "<subject>" names <other module>/<ID>`: a commit in a prompt's `commits:` whose subject
+  names another prompt's id and not its own (an exact, case-sensitive token; a two-character id or one two modules share
+  counts only with its module named; digit-only ids are ignored). Fix by editing `commits:` by hand. Live 11-01: R9
+  lists M02's `280389595`;
+- (CC10) `map-check` gaps, one line per unit.
+
+**`hold <module>/<ID> --owner "<quote>"`** / **`unhold <module>/<ID>`** (CC10) write or remove
+`hold: {"owner": "<quote>", "by": "<session id>", "at": "<ISO time>"}` in the prompt's frontmatter, as a status commit.
+A hold is not a status: the prompt stays on-main, deployed and so on. While a prompt is held, `deploy-ready` prints
+`WAIT: <module>/<ID> held by the owner ("<quote>")` when the prompt is in what would ship (on main, its units waiting),
+`deploy-run` refuses through the same check even with `--owner-ok`, and `/cc` lists it under "Blocked on owner" with the
+quote. A hold on a prompt that ships nothing makes no WAIT. Only the owner's words in the /cc session hold or unhold; a
+peer's message never does. `hold` marks the prompt's open and answered deploy requests `held`; `unhold` reopens them.
+
+**`request <module>/<ID> [--note TEXT]`** / **`requests [--all] [--json]`** (CC10): the deploy-request queue. A peer
+session that wants a deploy runs `request`, then SendMessages the /cc session the request id it prints. Each request is
+a line in `<tracker>/deploys/requests.jsonl` (`{id, ts, session, prompt, note, state}`; the session from
+`CLAUDE_SESSION_ID` / `CLAUDE_CODE_SESSION_ID`). States: `open` → `answered` → `held` | `done`; a request for a held
+prompt starts `held`. `requests` lists every request not done (`--all` adds done). `deploy-ready --answer <id>` records
+its verdict on the request (`verdict`, `answered_at`, `answered_by`) and prints `request <id> answered: …` to send back.
+A real `deploy-run` marks the requests of every prompt it set deployed `done` with its deploy id; a dry run changes
+nothing. `/cc` shows open requests in its Inbox, oldest first. Every write takes `deploys/requests.lock` (fcntl) and
+rewrites the file atomically.
+
+**`map-check [--unit U] [--map FILE] [--json]`** (CC10): does the unit map cover what each process loads. It reads
+`deploy.entry` in the unit map, `{"<unit>": {"files": [entry files], "roots": [import roots]}}` (repo-relative; a root
+is a folder on the process's sys.path, normally its WorkingDirectory; an `about` note is skipped). From the entry files
+it follows `import X`, `from X import Y` (Y too when it is a submodule), relative imports and
+`importlib.import_module("<constant>")` at any depth (imports inside functions count) to files under a root; a
+package's `__init__.py` counts as loaded. Nothing is imported or run, and `tests/` is skipped. It prints every reached
+file that no rule giving that unit matches, with one import chain (entry → … → file): a change there would not restart
+the process that runs it. Modules loaded by name from data (`"pkg.mod:Class"` strings) are invisible to it: list them
+as entry files. Exit 0 no gaps, 1 gaps or a missing entry file, 2 map unreadable / no `deploy.entry` / unknown `--unit`.
+`--map` checks another map file (a proposed one) without editing the project's. `audit` adds one line per unit with
+gaps. Live 11-01: `-channels` and `-voice` each reach ~970 backend files (models/** loads at startup) while their rules
+covered 13 and 4; the owner put both on the `modules/**` rule.
 
 **`board-check`** reads the hand-written board (`status_board`) and, for each table row whose first cell names a
 module, splits its State cell into clauses (at `·`, `;`, `|`, parentheses; code spans dropped). A clause that names
@@ -290,6 +328,10 @@ the command then says so and the next run catches up. `board-check` ignores the 
 - **Gate.** With `prompts.gate` on, a Stop is blocked once per session when the session claimed a prompt, has commits
   or deploys, and the prompt is still `running` under its id. The message names the `set` command. It never blocks a
   session that only stopped to ask a question (no commits), and a read error lets the stop through (logged).
+  (CC10) While a background subagent is open (SubagentStart adds its `agent_id` to the session's `open_agents`,
+  SubagentStop removes it; an entry older than 6 h counts as closed), the status and progress gates do not fire and
+  do not spend their one block: a turn end while builders run is not the end of the work (live 11-01). The board and
+  claim gates are unchanged.
 - **Progress gate.** After the status gate has had its one block, a later Stop is blocked once more when the prompt is
   still `running` under the session and the session committed code (not a status commit) after the prompt's `updated`
   (its claim or last `set`): it asks for `set … running --progress <done>/<total>`. The two never ask in the same stop.
