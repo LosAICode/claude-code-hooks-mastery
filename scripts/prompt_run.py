@@ -72,11 +72,14 @@ def _shell(cmd: str, run: Any, env: dict[str, str] | None = None, timeout: int =
 
 
 def _line_time(line: str) -> float | None:
+    """A log line's local stamp in epoch seconds; in the hour a DST fall-back repeats, the later reading (live 11-01
+    01:02 EST: read as EDT, a fresh ready line looked an hour old). The unit's start time is proven separately."""
     m = _STAMP.search(line or "")
     try:
-        return datetime.fromisoformat(m.group(1).replace(" ", "T")).timestamp() if m else None
+        t = datetime.fromisoformat(m.group(1).replace(" ", "T")) if m else None
     except ValueError:
         return None
+    return max(t.timestamp(), t.replace(fold=1).timestamp()) if t else None
 
 
 def prove(step: dict[str, Any], umap: dict[str, Any], start: int, run: Any, sleep: Callable[[float], None],

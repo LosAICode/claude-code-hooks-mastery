@@ -88,3 +88,25 @@ def test_the_subagent_hooks_record_open_agents(tmp_path):
     r = _run_hook("subagent_stop.py", {**agent("SubagentStop", "h1"), "stop_hook_active": False}, env, tmp_path)
     assert r.returncode == 0
     assert json.loads((d / f"{SID}.json").read_text())["open_agents"] == {}
+
+
+def test_ready_line_in_the_repeated_dst_hour_reads_as_the_later_time(monkeypatch):
+    """Live 11-01 01:02 EST: clocks fell back at 02:00 EDT, a ready line stamped 01:02 read as EDT (an hour early),
+    so deploy-run called a fresh restart "proof failed"."""
+    import importlib
+    import sys
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        prompt_run = importlib.import_module("prompt_run")
+        est = datetime(2026, 11, 1, 6, 2, 8, tzinfo=timezone.utc).timestamp()  # 01:02:08 EST, the second 01:02
+        assert prompt_run._line_time("[2026-11-01 01:02:08,000: INFO/MainProcess] w@h ready.") == est
+        assert prompt_run._line_time("2026-10-31 23:30:59,680 - x - INFO - y") == datetime(
+            2026, 11, 1, 3, 30, 59, tzinfo=timezone.utc).timestamp()
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
