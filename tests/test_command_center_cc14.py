@@ -327,3 +327,21 @@ def test_a_failed_deploy_run_still_closes_the_window(box, window, capsys, tmp_pa
     assert run("deploy-run", "--owner-ok", "go", "--no-commit") != 0
     assert not window.exists()
     assert "deploy stopped" in capsys.readouterr().out
+
+
+# --- Do 3: sandbox copies named after their prompt --------------------------------------------------------
+
+
+def test_sbx_path_names_the_sessions_prompt_and_counts_up(box, capsys, tmp_path, monkeypatch):
+    c = json.loads((tmp_path / "config.json").read_text())
+    c["prompts"]["sbx_root"] = str(tmp_path / "sbx")
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    (tmp_path / "sbx" / "sbx-agents-A1-1").mkdir(parents=True)
+    (tmp_path / "sbx" / "sbx-agents-A1-3").mkdir()
+    monkeypatch.setenv("CLAUDE_SESSION_ID", LIVE_SID)
+    assert run("sbx-path") == 0
+    assert capsys.readouterr().out.strip() == str(tmp_path / "sbx" / "sbx-agents-A1-4")
+    assert run("sbx-path", "agents/A2") == 0
+    assert capsys.readouterr().out.strip() == str(tmp_path / "sbx" / "sbx-agents-A2-1")
+    monkeypatch.setenv("CLAUDE_SESSION_ID", NEW_SID)
+    assert run("sbx-path") == 2

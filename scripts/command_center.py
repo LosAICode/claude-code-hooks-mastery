@@ -847,6 +847,35 @@ def take_over(view: View, p: pc.Prompt, sid: str, live: set[str], no_commit: boo
     return 0
 
 
+def cmd_sbx_path(view: View, args: argparse.Namespace) -> int:
+    """CC14 Do 3: the next free ``/var/tmp/sbx-<module>-<ID>-<n>`` for a frozen sandbox copy of the session's prompt
+    (or of ``ref``). Named after the prompt, ``set … done`` removes what is left; run_sandboxed_tests.sh removes it when
+    its run ends (unless --keep-root)."""
+    import prompt_cleanup as pcl
+
+    if args.ref:
+        try:
+            p = find_prompt(view, args.ref)
+        except LookupError as e:
+            print(e, file=sys.stderr)
+            return 2
+    else:
+        sid = args.session or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+        mine = [q for q in view.prompts if sid and str(q.meta.get("session_id") or "").startswith(sid)
+                and q.status not in pc.CLOSED]
+        if len(mine) != 1:
+            print("no prompt held by this session: pass module/ID (or --session <id>)" if not mine else
+                  "this session holds " + ", ".join(f"{q.module}/{q.id}" for q in mine) + ": pass module/ID",
+                  file=sys.stderr)
+            return 2
+        p = mine[0]
+    root = str(view.spec.get("sbx_root") or pcl.SBX_ROOT)
+    taken = [c.rsplit("-", 1)[-1] for c in pcl.sbx_copies(p.module, str(p.id or p.name), root)]
+    n = max([int(x) for x in taken if x.isdigit()] + [0]) + 1
+    print(os.path.join(root, f"sbx-{p.module.lower()}-{p.id or p.name}-{n}"))
+    return 0
+
+
 STALE_NOTES = re.compile(r"\b(?:queued|pending|waiting|todo|blocked)\b", re.IGNORECASE)
 
 
@@ -1996,6 +2025,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sub.add_parser("board-check", help="Status Board rows that say HELD/ON MAIN or DEPLOYED/LIVE against a prompt's status")
     bm = sub.add_parser("board-markers", help="add a generated Prompts: line to the first Status Board row per module")
     bm.add_argument("--no-commit", action="store_true")
+    sx = sub.add_parser("sbx-path", help="the next /var/tmp/sbx-<module>-<ID>-<n> for a frozen sandbox copy of your prompt")
+    sx.add_argument("ref", nargs="?", help="module/ID (default: the prompt this session holds)")
+    sx.add_argument("--session", help="the session id (default: this session)")
     c = sub.add_parser("claim", help="attach a live session to a prompt (running + session_id; arms its Stop gate)")
     c.add_argument("ref", help="ID, module/ID or file name")
     c.add_argument("--session", required=True, help="the session id (or a unique prefix)")
@@ -2070,6 +2102,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_sort(view, args)
     if args.cmd == "prompts":
         return cmd_prompts(view, args)
+    if args.cmd == "sbx-path":
+        return cmd_sbx_path(view, args)
     if args.cmd == "claim":
         return cmd_claim(view, args)
     if args.cmd == "deploy-check":
