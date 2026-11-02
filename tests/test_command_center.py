@@ -140,10 +140,10 @@ def test_set_by_file_name_and_no_commit(center, capsys):
 
 def test_set_ambiguous_or_unknown_id(center, capsys):
     (center / "docs/Prompts/history/History-B12-4-Dup.md").write_text("# dup\n")
-    assert run("set", "B12-4", "done", "--no-commit") == 2
+    assert run("set", "B12-4", "done", "--no-deploy", "fixture", "--proof", "fixture", "--no-commit") == 2
     assert "ambiguous" in capsys.readouterr().err
-    assert run("set", "funnels/B12-4", "done", "--no-commit") == 0
-    assert run("set", "Z99", "done", "--no-commit") == 2
+    assert run("set", "funnels/B12-4", "done", "--no-deploy", "fixture", "--proof", "fixture", "--no-commit") == 0
+    assert run("set", "Z99", "done", "--no-deploy", "fixture", "--proof", "fixture", "--no-commit") == 2
 
 
 def test_set_clears_todo_confirm(center):
@@ -180,9 +180,13 @@ def test_claim_refuses_a_gone_session_or_a_finished_prompt(center, capsys):
     for sid in ("ended000-3333", "stale000-4444"):
         assert run("claim", "funnels/B12-4", "--session", sid, "--no-commit") == 2
         assert "not a live session" in capsys.readouterr().err
-    assert run("claim", "funnels/B11", "--session", "d60450f0-1111", "--no-commit") == 2
-    assert "deployed" in capsys.readouterr().err
+    # CC14: a deployed prompt is taken over (status kept); a done one is never claimed
+    assert run("claim", "funnels/B11", "--session", "d60450f0-1111", "--no-commit") == 0
+    assert "taken over" in capsys.readouterr().out
     assert "status: deployed" in (center / "docs/Prompts/funnels/Funnels-B11-Perf.md").read_text()
+    pc.set_status(pc.prompts_cfg(cc.load_config()), "docs/Prompts/funnels/Funnels-B11-Perf.md", "done")
+    assert run("claim", "funnels/B11", "--session", "d60450f0-1111", "--no-commit") == 2
+    assert "done" in capsys.readouterr().err
 
 
 def test_claim_takes_over_a_stalled_prompt(center):

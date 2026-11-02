@@ -589,6 +589,10 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     if args.close and args.status not in pc.CLOSED:
         print(f"--close closes the issue of a finished prompt ({', '.join(pc.CLOSED)}), not {args.status}", file=sys.stderr)
         return 2
+    why_not = done_refusal(p, args)
+    if why_not:
+        print(why_not, file=sys.stderr)
+        return 2
     tests = tests_value(p, args)
     if tests is False:
         return 2
@@ -598,7 +602,8 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
               "(--tests <results file> or --no-tests \"<why>\"); deploy-plan lists it as not proven tested", file=sys.stderr)
     try:
         clear = list(args.clear or []) + (["needs_owner"] if args.needs_owner == "" else [])
-        pc.set_status(view.spec, p.rel, args.status, clear=clear, commit=args.commit, deployed=args.deployed,
+        deployed = args.deployed or (f"none: {args.no_deploy}" if args.no_deploy and args.status == "done" else None)
+        pc.set_status(view.spec, p.rel, args.status, clear=clear, commit=args.commit, deployed=deployed,
                       notes=args.notes, needs_owner=args.needs_owner or None, tests=tests, progress=progress,
                       proof=args.proof)
         moved = pc.place(view.spec, p.rel, args.status)[1] if view.spec.get("status_folders") else []
@@ -619,6 +624,21 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     if args.comment or args.close:
         return post_progress(view, p, args)
     return 0
+
+
+def done_refusal(p: pc.Prompt, args: argparse.Namespace) -> str | None:
+    """CC14: `done` = proven live. Refused unless the prompt is deployed (or ``--no-deploy "<why>"`` for docs or
+    tooling that no unit runs) and has a ``proof:`` (or ``--proof``). Live 11-02: M18 was set done while on main, so
+    deploy-ready left its P0 fix out of "prompts to ship"."""
+    if args.status != "done" or p.status == "done":
+        return None
+    ref = f"{p.module}/{p.id or p.name}"
+    if p.status != "deployed" and not args.no_deploy:
+        return (f"{ref} is {p.status}, not deployed: done means proven live. After the restart, `set {ref} deployed`; "
+                f"for docs or tooling no unit runs, `--no-deploy \"<why>\"`")
+    if not (args.proof or str(p.meta.get("proof") or "").strip()):
+        return f"{ref} has no proof: line: give `--proof \"<what proved it>\"`"
+    return None
 
 
 def tests_value(p: pc.Prompt, args: argparse.Namespace) -> str | None | bool:
@@ -760,17 +780,36 @@ def cmd_claim(view: View, args: argparse.Namespace) -> int:
         print(f"{args.session!r} {why}", file=sys.stderr)
         return 2
     sid = sids[0]
+    if p.status in pc.TAKEOVER:
+        return take_over(view, p, sid, live, args.no_commit)
     prev = pc.mark_running(view.spec, p.rel, sid, live - {sid})
     if prev is None:
         holder = str(p.meta.get("session_id") or "")[:8]
         print(f"{p.module} {p.id or p.name} is {p.status}" + (f" ({holder}, live)" if p.status == "running" else "")
-              + ": only pending, blocked or a gone session's running prompt can be claimed", file=sys.stderr)
+              + ": only pending, blocked or a gone session's running prompt can be claimed, or an "
+              + "/".join(pc.TAKEOVER) + " one taken over", file=sys.stderr)
         return 2
     attach_prompt(sid, p.rel, prev)
     moved = pc.place(view.spec, p.rel, "running")[1] if view.spec.get("status_folders") else []
     print(f"{p.module} {p.id or p.name}: {prev} → running ({sid[:8]})")
     commit_change(view, [p.module], [p.rel, *moved], f"docs(prompts): {p.module} {p.id or p.name} running ({sid[:8]}, by hand)",
                   args.no_commit)
+    return 0
+
+
+def take_over(view: View, p: pc.Prompt, sid: str, live: set[str], no_commit: bool) -> int:
+    """CC14: a new session carries on an on-branch/on-main/deployed prompt (handover). The status stays; deploy-run's
+    and deploy-check's Tell: lines reach the new session (live 11-02: A12b and A04c said "(no live session)")."""
+    prev = pc.take_over(view.spec, p.rel, sid, live - {sid})
+    if prev is None:
+        holder = str(p.meta.get("session_id") or "")[:8]
+        print(f"{p.module} {p.id or p.name} is {p.status} and its session {holder} is live: it hands over "
+              "itself (or is gone first)", file=sys.stderr)
+        return 2
+    attach_prompt(sid, p.rel, prev)
+    old = str(p.meta.get("session_id") or "")
+    print(f"{p.module} {p.id or p.name}: {prev}, taken over by {sid[:8]}" + (f" from {old[:8]}" if old and old != sid else ""))
+    commit_change(view, [p.module], [p.rel], f"docs(prompts): {p.module} {p.id or p.name} taken over ({sid[:8]})", no_commit)
     return 0
 
 
@@ -1846,6 +1885,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     s.add_argument("--no-commit", action="store_true")
     s.add_argument("--comment", action="store_true", help="post one progress comment (status + commit) to its issue")
     s.add_argument("--close", action="store_true", help="close its issue with that comment (done/skipped/superseded)")
+    s.add_argument("--no-deploy", dest="no_deploy", metavar="WHY",
+                   help="done without deployed: docs or tooling no unit runs (writes `deployed: none: WHY`)")
+    s.add_argument("--keep-worktree", dest="keep_worktree", action="store_true",
+                   help="done/skipped/superseded: leave its worktrees, branches and sandbox copies")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="done/skipped/superseded: show what the clean-up would remove; write nothing")
     i = sub.add_parser("issues", help="prompts × GitHub issues: missing, unlinked, duplicates, state mismatches")
     i.add_argument("--module")
     i.add_argument("--fix", action="store_true", help="write the issue: keys it can match (never creates an issue)")

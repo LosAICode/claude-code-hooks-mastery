@@ -174,6 +174,7 @@ MARKS = {"pending": "⚪", "running": "▶", "stalled": "▶?", "on-branch": "�
 FINISHED = ("done", "deployed")
 NOT_COUNTED = ("skipped", "superseded")
 CLOSED = ("done", "skipped", "superseded")  # a prompt nobody runs again: filed under COMPLETED_FOLDER
+TAKEOVER = ("on-branch", "on-main", "deployed")  # CC14: a new session can take these over; the status stays
 COMPLETED_FOLDER, PENDING_FOLDER = "Completed", "Pending"
 INDEX_NAME = re.compile(r"^(?:[A-Za-z-]+-)?00-README\.md$|^README\.md$", re.IGNORECASE)
 _ID = re.compile(r"^[A-Z]{0,2}\d+[a-z]?$")
@@ -690,6 +691,27 @@ def mark_running(spec: dict[str, Any], rel: str, sid: str, live_sids: set[str]) 
             return None
         new = write_meta(path, {"status": "running", "session_id": sid, "updated": _now_iso()},
                          expect={"status": (None, "", prev)})
+    return prev if new is not None else None
+
+
+def take_over(spec: dict[str, Any], rel: str, sid: str, live_sids: set[str]) -> str | None:
+    """Hand an on-branch/on-main/deployed prompt to a new session (CC14): ``session_id`` becomes ``sid``, the old one
+    goes into ``previous_sessions``, the status stays. None when the status is not one of ``TAKEOVER`` or its
+    session is still live (it hands over itself, or is gone first)."""
+    spec = _spec(spec)
+    path = Path(str(spec["repo"])) / rel
+    with _PromptLock(_lock_dir(spec), rel):
+        meta, _, _ = parse_frontmatter(_read_head(path))
+        prev = str(meta.get("status") or "")
+        old = str(meta.get("session_id") or "")
+        if prev not in TAKEOVER or (old and old != sid and old in live_sids):
+            return None
+        before = meta.get("previous_sessions")
+        hist = [str(x) for x in before] if isinstance(before, list) else ([str(before)] if before else [])
+        if old and old != sid and old not in hist:
+            hist.append(old)
+        new = write_meta(path, {"session_id": sid, "previous_sessions": hist or None, "updated": _now_iso()},
+                         expect={"status": (prev,), "session_id": (meta.get("session_id"),)})
     return prev if new is not None else None
 
 
