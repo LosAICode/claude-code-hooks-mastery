@@ -593,6 +593,12 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     if why_not:
         print(why_not, file=sys.stderr)
         return 2
+    if args.dry_run:
+        if args.status not in pc.CLOSED:
+            print(f"--dry-run shows the clean-up of a finished prompt ({', '.join(pc.CLOSED)})", file=sys.stderr)
+            return 2
+        cleanup_after(view, p, dry_run=True)
+        return 0
     tests = tests_value(p, args)
     if tests is False:
         return 2
@@ -621,9 +627,37 @@ def cmd_set(view: View, args: argparse.Namespace) -> int:
     print(f"{p.module} {p.id or p.name}: {p.status} → {args.status}")
     commit_change(view, [p.module], [p.rel, *moved], f"docs(prompts): {p.module} {p.id or p.name} → {args.status}",
                   args.no_commit)
+    if args.status in pc.CLOSED and not args.keep_worktree:
+        cleanup_after(view, p)
     if args.comment or args.close:
         return post_progress(view, p, args)
     return 0
+
+
+def cleanup_after(view: View, p: pc.Prompt, dry_run: bool = False) -> None:
+    """CC14 Do 1: remove the worktrees, merged branches and ``/var/tmp/sbx-<module>-<ID>*`` copies a finished prompt
+    left, each only when nothing in it would be lost (``prompt_cleanup``); print every REMOVE and KEEP."""
+    import prompt_cleanup as pcl
+
+    repos = [str(view.spec["repo"])] + [str(r["path"]) for r in view.spec.get("repos") or [] if r.get("path")]
+    prev = p.meta.get("previous_sessions")
+    sids = {str(p.meta.get("session_id") or "")} | {str(x) for x in (prev if isinstance(prev, list) else [prev] if prev else [])}
+    paths = {str(s.get("worktree")).rstrip("/") for s in view.sessions
+             if s.get("worktree") and (str(s.get("session_id")) in sids or s.get("prompt_file") == p.rel)}
+    rows = pcl.plan(repos, pc.commits_of(p.meta), paths, p.module, str(p.id or p.name),
+                    pcl.prompt_refs(q for q in view.prompts if q.rel != p.rel),
+                    sbx_root=str(view.spec.get("sbx_root") or pcl.SBX_ROOT))
+    if not rows:
+        print("clean-up: nothing left behind (no worktree, branch or sbx copy maps to it)")
+        return
+    for r in rows:
+        if r["action"] == "keep" or dry_run:
+            verb = "KEEP  " if r["action"] == "keep" else "WOULD REMOVE"
+            print(f"{verb} {r['kind']} {r['path']}" + (f" ({r['branch']})" if r.get("branch") else "") + f": {r['why']}")
+    if not dry_run:
+        freed = pcl.apply(rows)
+        pcl.git(view.spec["repo"], "worktree", "prune")
+        print(f"clean-up freed {freed / 1e9:.2f} GB")
 
 
 def done_refusal(p: pc.Prompt, args: argparse.Namespace) -> str | None:
