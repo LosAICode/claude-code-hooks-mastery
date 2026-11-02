@@ -939,6 +939,7 @@ def restart_gate(payload: dict[str, Any], cfg: dict[str, Any],
 
 RESTART_WINDOW_FILE = "/run/lock/neurogen-restart-window"  # the live config's prompts.restart_window
 DOCS_ONLY_PREFIXES = ("Documentation/", "reports/")
+_COMMIT_ALL = re.compile(r"\bcommit\b[^;&|]*?\s(?:-[a-zA-Z]*a[a-zA-Z]*|--all)(?=\s|$)")
 LANDING_BLOCK_REASON = (
     "BLOCKED: a restart window is open ({why}; until {until}): no code commit or merge to main until the /cc session "
     "says 'deploy done'. Docs-only commits ({docs}) still pass. Commit on your branch and land after. A stale window "
@@ -963,7 +964,7 @@ def restart_window(cfg: dict[str, Any], now: float | None = None) -> dict[str, A
 
 
 def docs_only(files: list[str], prefixes: tuple[str, ...] = DOCS_ONLY_PREFIXES) -> bool:
-    return bool(files) and all(f.lstrip("./").startswith(prefixes) for f in files)
+    return bool(files) and all(os.path.normpath(f).startswith(prefixes) for f in files)
 
 
 def landing_guard(payload: dict[str, Any], cfg: dict[str, Any], git: GitRunner = run_git) -> str | None:
@@ -990,6 +991,8 @@ def landing_guard(payload: dict[str, Any], cfg: dict[str, Any], git: GitRunner =
                     files = [os.path.relpath(os.path.join(git_dir, f), repo) for f in rule.get("paths") or []]
                     if not files:
                         files = git(git_dir, "diff", "--cached", "--name-only")[1].splitlines()
+                        if _COMMIT_ALL.search(command):  # -a / --all also commits tracked edits not yet staged
+                            files += git(git_dir, "diff", "--name-only")[1].splitlines()
                     if docs_only(files, prefixes):
                         continue
                 why = str(win.get("owner_ok") or "deploy-run")[:80]

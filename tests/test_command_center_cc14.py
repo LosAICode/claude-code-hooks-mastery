@@ -293,6 +293,16 @@ def test_the_guard_passes_docs_commits_branches_and_closed_windows(box, window, 
     git(box, "add", "Documentation/r.md")
     assert guard(box, 'git commit -m "docs: row"') is None
     assert guard(box, 'git commit -m "docs: row" -- Documentation/r.md') is None
+    (box / "modules").mkdir(exist_ok=True)
+    (box / "modules" / "y.py").write_text("y")
+    git(box, "add", "modules/y.py")
+    git(box, "commit", "-q", "-m", "y")
+    (box / "modules" / "y.py").write_text("y2")                  # a tracked code edit, not staged
+    (box / "Documentation" / "r.md").write_text("row 2")
+    git(box, "add", "Documentation/r.md")
+    assert guard(box, 'git commit -m "docs: row"') is None       # commits only what is staged
+    assert guard(box, 'git commit -am "docs: row"')              # -a takes the code edit too
+    assert guard(box, 'git commit --all -m "docs: row"')
     assert guard(box, "python3 /x/scripts/command_center.py set agents/A1 deployed") is None
     git(box, "worktree", "add", "-q", "-b", "side", str(tmp_path / "side"))
     assert guard(box, 'git commit -m "fix: y"', cwd=tmp_path / "side") is None
