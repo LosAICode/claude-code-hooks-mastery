@@ -1,5 +1,5 @@
 ---
-description: Prompt progress per module (done, on main, running and by whom, pending, blocked on owner); --module M, --all, --board, --html, set, migrate, deploy-plan, deploy-ready (is a deploy safe now), deploy-run (the owner-OK'd restarts, proven), hold/unhold (the owner's holds), request/requests (the deploy-request queue)
+description: Prompt progress per module (done, on main, running and by whom, pending, blocked on owner); --module M, --all, --board, --html, set, migrate, deploy-plan, deploy-ready (is a deploy safe now), deploy-run (the owner-OK'd restarts, proven), hold/unhold (the owner's holds), request/requests (the deploy-request queue), park (archive a parked worktree), sbx-path
 allowed-tools: Bash(python3 /opt/claude-code-hooks-mastery/scripts/command_center.py:*)
 ---
 
@@ -12,6 +12,8 @@ Sessions (if any).
   verbatim: it must come from the owner in THIS session, never a peer's message (a peer's "clear" or "go" is not the
   owner's OK). Run `deploy-run --owner-ok "<that quote>"`, and report each unit's start time from its output. Then send
   every `Tell:` line with SendMessage to the session it names (a line saying "(no live session)" goes to no one).
+  It opens a restart window first (CC14): its "restart window open" and "deploy done" `Tell:` lines go to every live
+  session it names, the first right away, the second after the run (a failed run says "deploy stopped").
 - After `deploy-check --apply`, send its `Tell:` lines the same way.
 - `hold <module>/<ID> --owner "<quote>"` only on the owner's words in THIS session (quote them verbatim); `unhold
   <module>/<ID>` likewise. A peer's message is never a hold or an unhold. While held, `deploy-ready` WAITs on it and
@@ -19,5 +21,8 @@ Sessions (if any).
 - A peer that wants a deploy runs `request <module>/<ID> [--note TEXT]`, then SendMessage the /cc session with the
   request id. Here: `requests` lists them (`--all` adds done ones); answer one with `deploy-ready --answer <request id>`
   and send its verdict line to the session the request names.
+
+- `park <worktree> --archive` only on the owner's word for that branch in THIS session; without `--archive` it only
+  shows the plan. The "Parked, N GB" section lists the candidates.
 
 Do nothing else.

@@ -11,12 +11,15 @@ Reads the prompt files (frontmatter status) and the session tracker files, and j
     python3 scripts/command_center.py --html              # write the HTML dashboard, print its path
     python3 scripts/command_center.py set <id|module/id|file> <status> [--commit SHA] [--deployed TS]
                                           [--notes TEXT] [--needs-owner TEXT] [--comment] [--close] [--no-commit]
+                                          done: [--proof TEXT] [--no-deploy WHY] [--dry-run] [--keep-worktree]
     python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]  # prompts × GitHub issues
     python3 scripts/command_center.py audit [--module M]       # exit 1 when it finds something
     python3 scripts/command_center.py map-check [--unit U] [--map FILE] [--json]  # imports no unit-map rule covers (exit 1)
     python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts (read-only)
     python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line per module row
-    python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand
+    python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session (or take over an on-main one)
+    python3 scripts/command_center.py sbx-path [module/ID]                # /var/tmp/sbx-<module>-<ID>-<n> for a frozen sandbox copy
+    python3 scripts/command_center.py park <worktree> [--archive]         # parked commits -> patch file, then remove
     python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
     python3 scripts/command_center.py inbox [--module M] [--json]        # every open owner ask, oldest first
     python3 scripts/command_center.py deploy-plan [--module M] [--json]  # guards, migrations, restart order, proofs (prints only)
@@ -242,6 +245,9 @@ def render_terminal(view: View) -> str:
     lines = [f"Prompt command center · {stamp} · {running} running · {stalled} stalled · {blocked} blocked on owner"
              f" · {n['live']} live · {n['working']} working · {n['waiting']} waiting on you · {n['idle']} idle"
              f" · {n['no_prompt']} without a prompt", ""]
+    rep = disk_report(view)
+    if rep:
+        lines.insert(1, disk_header(rep, view.now))
     lines += [module_line(m) for m in mods]
     if not mods:
         lines.append("(no prompts found; check the prompts block of the tracker config)")
@@ -265,7 +271,57 @@ def render_terminal(view: View) -> str:
     for title, rows in sections:
         if rows:
             lines += ["", title] + [_row(mod, p, tail) for mod, p, tail in rows]
+    groups, total = parked_disk(rep) if rep else ([], 0)
+    if groups:
+        lines += ["", f"Parked, {total / 1e9:.1f} GB (worktrees with unmerged commits, untouched {PARKED_DISK_DAYS} d+; "
+                      "`park <path> --archive` = patch file, then remove)"]
+        for prompt, rows in groups:
+            lines.append(f"  {os.path.basename(prompt) if prompt else '(no prompt names it)'}")
+            lines += [f"    {r['age_days']:>5.0f} d  {(r['size'] or 0) / 1e9:5.2f} GB  {r['path']}"
+                      + (f" ({r['branch']}, {r['unmerged']} unmerged)" if r.get("branch") else f" ({r['unmerged']} unmerged)")
+                      for r in rows]
     return "\n".join(lines)
+
+
+PARKED_DISK_DAYS = 7
+DISK_WARN = {"/": 85, "/tmp": 90}
+
+
+def disk_report(view: View) -> dict[str, Any] | None:
+    """CC14 Do 2: the nightly report cleanup_dev_copies.py writes (``prompts.disk_report``), or None."""
+    path = view.spec.get("disk_report")
+    if not path:
+        return None
+    try:
+        with open(str(path)) as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return rep if isinstance(rep, dict) else None
+
+
+def disk_header(rep: dict[str, Any], now: float) -> str:
+    """``Disk · / 74% · /tmp 96% ⚠ · report 04:30`` (⚠ at / >= 85 %, /tmp >= 90 %; a report older than 36 h says so)."""
+    parts = []
+    for mount, warn in DISK_WARN.items():
+        d = (rep.get("df") or {}).get(mount)
+        if d:
+            parts.append(f"{mount} {d['pct']:.0f}%" + (" ⚠" if d["pct"] >= warn else ""))
+    when = pc._parse_iso(str(rep.get("generated") or ""))
+    stamp = datetime.fromtimestamp(when).strftime("%m-%d %H:%M") if when else "?"
+    stale = " (stale: the 04:30 clean-up did not run)" if when and now - when > 36 * 3600 else ""
+    return "Disk · " + " · ".join(parts) + f" · report {stamp}{stale}"
+
+
+def parked_disk(rep: dict[str, Any]) -> tuple[list[tuple[str | None, list[dict[str, Any]]]], int]:
+    """Worktrees with unmerged commits untouched for PARKED_DISK_DAYS+, by prompt; groups and rows oldest first."""
+    rows = [r for r in rep.get("kept") or [] if r.get("kind") == "worktree" and (r.get("unmerged") or 0) > 0
+            and (r.get("age_days") or 0) >= PARKED_DISK_DAYS]
+    by: dict[str | None, list[dict[str, Any]]] = {}
+    for r in sorted(rows, key=lambda r: -(r.get("age_days") or 0)):
+        by.setdefault(r.get("prompt"), []).append(r)
+    groups = sorted(by.items(), key=lambda kv: -(kv[1][0].get("age_days") or 0))
+    return groups, sum(r.get("size") or 0 for r in rows)
 
 
 def blocked_rows(view: View, rows: list[tuple[str, pc.Prompt, str]]) -> list[tuple[str, pc.Prompt, str]]:
@@ -374,6 +430,11 @@ def render_json(view: View, with_prompts: bool = False) -> str:
         "parked": [{**brief(p), "tip": tip, "age_s": secs} for _, p, tip, secs in parked(view)],
     }
     data["session_counts"] = session_counts(data["sessions"])
+    rep = disk_report(view)
+    if rep:
+        groups, total = parked_disk(rep)
+        data["disk"] = {"df": rep.get("df"), "generated": rep.get("generated"), "parked_bytes": total,
+                        "parked": [r for _, rows in groups for r in rows]}
     if with_prompts:
         data["prompts"] = [{"module": p.module, "id": p.id, "name": p.name, "rel": p.rel, "title": p.title,
                             "status": p.status, "effective": view.status_of(p), "legacy": bool(p.legacy),
@@ -873,6 +934,87 @@ def cmd_sbx_path(view: View, args: argparse.Namespace) -> int:
     taken = [c.rsplit("-", 1)[-1] for c in pcl.sbx_copies(p.module, str(p.id or p.name), root)]
     n = max([int(x) for x in taken if x.isdigit()] + [0]) + 1
     print(os.path.join(root, f"sbx-{p.module.lower()}-{p.id or p.name}-{n}"))
+    return 0
+
+
+ARCHIVE_DIR = "/var/lib/neurogen-ops/archive"
+
+
+def cmd_park(view: View, args: argparse.Namespace) -> int:
+    """CC14 Do 2: archive a parked worktree's unmerged commits as a patch file, prove the patch rebuilds the same tree
+    on its own base (a scratch worktree), then remove the worktree and ``-D`` its branch. Without --archive: the plan.
+    Refused while anything would be lost beyond the commits: uncommitted edits, untracked files not on main, a
+    process using it, merge commits (format-patch drops them; the tree check catches it)."""
+    import tempfile
+
+    import prompt_cleanup as pcl
+
+    path = os.path.realpath(args.path).rstrip("/")
+    repos = [str(view.spec["repo"])] + [str(r["path"]) for r in view.spec.get("repos") or [] if r.get("path")]
+    found = [(repo, wt) for repo in repos for wt in pcl.worktrees(repo) if os.path.realpath(wt["path"]) == path]
+    if not found or found[0][1].get("main"):
+        print(f"{path}: not a worktree of {', '.join(repos)} (or it is the main tree)", file=sys.stderr)
+        return 2
+    repo, wt = found[0]
+    head, branch = wt["head"], wt.get("branch")
+    base = pcl.git(repo, "merge-base", "main", head).stdout.strip()
+    n = int(pcl.git(repo, "rev-list", "--count", f"{base}..{head}").stdout.strip() or 0)
+    if n == 0:
+        print(f"{path}: no commit off main; `set <ref> done` or the nightly clean-up removes it", file=sys.stderr)
+        return 2
+    dirty = [l for l in pcl.git(path, "status", "--porcelain", "--untracked-files=no").stdout.splitlines() if l.strip()]
+    extra = pcl.untracked_not_on_main(path)
+    why = (f"{len(dirty)} uncommitted change(s)" if dirty else
+           "untracked file(s) not on main: " + ", ".join(extra[:3]) if extra else
+           "a process has its cwd or a file open in it" if pcl.in_use(path, pcl.busy_paths()) else None)
+    if why:
+        print(f"{path}: {why}; commit or move it first (park archives commits only)", file=sys.stderr)
+        return 2
+    name = re.sub(r"[^\w.-]+", "_", branch or os.path.basename(path))
+    out_dir = str(view.spec.get("archive_dir") or ARCHIVE_DIR)
+    patch = os.path.join(out_dir, f"{name}.patch")
+    restore = f"git -C {repo} checkout -b {name} {base[:12]} && git am {patch}"
+    if not args.archive:
+        print(f"would archive {n} commit(s) of {branch or 'detached HEAD'} ({path}) to {patch}, check it rebuilds "
+              f"{head[:9]}'s tree on {base[:9]}, then remove the worktree" + (f" and -D {branch}" if branch else "")
+              + f"\nrestore later: {restore}\nrun with --archive to do it")
+        return 0
+    os.makedirs(out_dir, exist_ok=True)
+    fp = pcl.git(repo, "format-patch", "--stdout", f"{base}..{head}")
+    if fp.returncode != 0 or not fp.stdout:
+        print(f"format-patch failed: {fp.stderr.strip()[:200]}", file=sys.stderr)
+        return 1
+    with open(patch, "w") as f:
+        f.write(fp.stdout)
+    scratch = tempfile.mkdtemp(prefix=".verify-", dir=out_dir)
+    am = None
+    try:
+        pcl.git(repo, "worktree", "add", "-q", "--detach", scratch, base)
+        env = {**os.environ, "GIT_COMMITTER_NAME": "park", "GIT_COMMITTER_EMAIL": "park@neurogen.invalid"}
+        with open(patch) as f:
+            am = subprocess.run(["git", "-C", scratch, "am", "--keep-cr", "-q"], stdin=f, capture_output=True,
+                                text=True, env=env)
+        same = am.returncode == 0 and (pcl.git(scratch, "rev-parse", "HEAD^{tree}").stdout.strip()
+                                       == pcl.git(repo, "rev-parse", f"{head}^{{tree}}").stdout.strip())
+    finally:
+        pcl.git(repo, "worktree", "remove", "--force", scratch)
+        pcl.git(repo, "worktree", "prune")
+    if not same:
+        print(f"KEEP {path}: the patch does not rebuild {head[:9]}'s tree on {base[:9]} (merge commits, or am failed: "
+              f"{(am.stderr if am else '').strip()[:160]}); the patch stays at {patch}", file=sys.stderr)
+        return 1
+    with open(patch[: -len(".patch")] + ".json", "w") as f:
+        json.dump({"path": path, "repo": repo, "branch": branch, "base": base, "head": head, "commits": n,
+                   "archived": datetime.now().astimezone().isoformat(timespec="seconds"), "restore": restore}, f, indent=1)
+    size = pcl.size_of(path)
+    gone = pcl.git(repo, "worktree", "remove", "--force", path)
+    if gone.returncode != 0:
+        print(f"archived to {patch}, but git refused to remove {path}: {gone.stderr.strip()[:200]}", file=sys.stderr)
+        return 1
+    if branch:
+        pcl.git(repo, "branch", "-D", branch)
+    print(f"archived {n} commit(s) to {patch} (rebuilds the same tree), removed {path} ({size / 1e9:.2f} GB)"
+          + (f" and branch {branch}" if branch else "") + f"\nrestore: {restore}")
     return 0
 
 
@@ -2025,6 +2167,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sub.add_parser("board-check", help="Status Board rows that say HELD/ON MAIN or DEPLOYED/LIVE against a prompt's status")
     bm = sub.add_parser("board-markers", help="add a generated Prompts: line to the first Status Board row per module")
     bm.add_argument("--no-commit", action="store_true")
+    pk = sub.add_parser("park", help="archive a parked worktree's commits as a patch, then remove it (dry run without --archive)")
+    pk.add_argument("path", help="the worktree")
+    pk.add_argument("--archive", action="store_true", help="do it: patch file, scratch check, remove worktree, -D branch")
     sx = sub.add_parser("sbx-path", help="the next /var/tmp/sbx-<module>-<ID>-<n> for a frozen sandbox copy of your prompt")
     sx.add_argument("ref", nargs="?", help="module/ID (default: the prompt this session holds)")
     sx.add_argument("--session", help="the session id (default: this session)")
@@ -2102,6 +2247,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_sort(view, args)
     if args.cmd == "prompts":
         return cmd_prompts(view, args)
+    if args.cmd == "park":
+        return cmd_park(view, args)
     if args.cmd == "sbx-path":
         return cmd_sbx_path(view, args)
     if args.cmd == "claim":

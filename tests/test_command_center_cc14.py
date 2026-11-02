@@ -345,3 +345,107 @@ def test_sbx_path_names_the_sessions_prompt_and_counts_up(box, capsys, tmp_path,
     assert capsys.readouterr().out.strip() == str(tmp_path / "sbx" / "sbx-agents-A2-1")
     monkeypatch.setenv("CLAUDE_SESSION_ID", NEW_SID)
     assert run("sbx-path") == 2
+
+
+# --- Do 2: the nightly disk report in /cc, park --archive -----------------------------------------------
+
+
+def report_rows(tmp_path):
+    return {"generated": "2026-10-30T04:30:00", "df": {"/": {"pct": 74.2}, "/tmp": {"pct": 96.0}},
+            "kept": [
+                {"path": "/w/a12-old", "kind": "worktree", "prompt": "docs/Prompts/agents/Agents-A1-X.md",
+                 "branch": "a12", "age_days": 40, "size": 2_000_000_000, "why": "3 commit(s) not on main", "unmerged": 3},
+                {"path": "/w/a12-newer", "kind": "worktree", "prompt": "docs/Prompts/agents/Agents-A1-X.md",
+                 "branch": "a12b", "age_days": 9, "size": 500_000_000, "why": "1 commit(s) not on main", "unmerged": 1},
+                {"path": "/w/lost", "kind": "worktree", "prompt": None, "branch": None, "age_days": 20,
+                 "size": 1_000_000_000, "why": "2 commit(s) not on main", "unmerged": 2},
+                {"path": "/w/fresh", "kind": "worktree", "prompt": None, "branch": "f", "age_days": 2,
+                 "size": 9_000_000_000, "why": "1 commit(s) not on main", "unmerged": 1},
+                {"path": "/w/dirty", "kind": "worktree", "prompt": None, "branch": "d", "age_days": 30,
+                 "size": 9_000_000_000, "why": "2 uncommitted change(s)", "unmerged": 0},
+            ]}
+
+
+@pytest.fixture
+def report(box, tmp_path):
+    path = tmp_path / "disk_report.json"
+    path.write_text(json.dumps(report_rows(tmp_path)))
+    c = json.loads((tmp_path / "config.json").read_text())
+    c["prompts"]["disk_report"] = str(path)
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    return path
+
+
+def test_cc_shows_the_disk_header_and_parked_gb_by_prompt_oldest_first(report, capsys):
+    assert run() == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[1] == "Disk · / 74% · /tmp 96% ⚠ · report 10-30 04:30"
+    assert "Parked, 3.5 GB (worktrees with unmerged commits, untouched 7 d+;" in out
+    tail = out[out.index("Parked, 3.5 GB"):]
+    assert tail.index("Agents-A1-X.md") < tail.index("/w/a12-old") < tail.index("/w/a12-newer") < tail.index(
+        "(no prompt names it)") < tail.index("/w/lost")
+    assert "/w/fresh" not in tail and "/w/dirty" not in tail
+
+
+def test_cc_json_carries_the_disk_block(report, capsys):
+    assert run("--json") == 0
+    disk = json.loads(capsys.readouterr().out)["disk"]
+    assert disk["parked_bytes"] == 3_500_000_000 and [r["path"] for r in disk["parked"]] == ["/w/a12-old", "/w/a12-newer", "/w/lost"]
+
+
+def test_a_stale_report_says_so_and_no_config_key_shows_nothing(box, report, capsys, tmp_path):
+    rep = report_rows(tmp_path)
+    rep["generated"] = "2026-10-28T04:30:00"
+    report.write_text(json.dumps(rep))
+    run()
+    assert "stale" in capsys.readouterr().out.splitlines()[1]
+    c = json.loads((tmp_path / "config.json").read_text())
+    del c["prompts"]["disk_report"]
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    run()
+    assert "Disk ·" not in capsys.readouterr().out
+
+
+@pytest.fixture
+def parked_wt(box, tmp_path, monkeypatch):
+    import prompt_cleanup as pcl
+
+    monkeypatch.setattr(pcl, "busy_paths", lambda proc="/proc": set())
+    c = json.loads((tmp_path / "config.json").read_text())
+    c["prompts"]["archive_dir"] = str(tmp_path / "archive")
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    w = tmp_path / "parked"
+    git(box, "worktree", "add", "-q", "-b", "old-idea", str(w))
+    for i in range(2):
+        (w / f"idea{i}.py").write_text(f"idea {i}\n")
+        git(w, "add", f"idea{i}.py")
+        git(w, "commit", "-q", "-m", f"idea {i}")
+    return w
+
+
+def test_park_without_archive_only_says_what_it_would_do(box, parked_wt, capsys, tmp_path):
+    assert run("park", str(parked_wt)) == 0
+    assert "would archive 2 commit(s) of old-idea" in capsys.readouterr().out
+    assert parked_wt.is_dir() and not (tmp_path / "archive").exists()
+
+
+def test_park_archive_writes_a_patch_that_rebuilds_the_branch_then_removes_it(box, parked_wt, capsys, tmp_path):
+    tip_tree = git(box, "rev-parse", "old-idea^{tree}")
+    assert run("park", str(parked_wt), "--archive") == 0
+    patch = tmp_path / "archive" / "old-idea.patch"
+    assert patch.is_file() and json.loads((tmp_path / "archive" / "old-idea.json").read_text())["commits"] == 2
+    assert not parked_wt.exists() and "old-idea" not in git(box, "branch", "--list", "old-idea")
+    base = json.loads((tmp_path / "archive" / "old-idea.json").read_text())["base"]
+    git(box, "worktree", "add", "-q", "-b", "restored", str(tmp_path / "restored"), base)
+    git(tmp_path / "restored", "am", "-q", str(patch))
+    assert git(tmp_path / "restored", "rev-parse", "HEAD^{tree}") == tip_tree
+
+
+def test_park_refuses_uncommitted_edits_or_stray_files(box, parked_wt, capsys):
+    (parked_wt / "idea0.py").write_text("edited\n")
+    assert run("park", str(parked_wt), "--archive") == 2
+    assert "uncommitted" in capsys.readouterr().err
+    git(parked_wt, "checkout", "--", "idea0.py")
+    (parked_wt / "scratch.txt").write_text("mine\n")
+    assert run("park", str(parked_wt), "--archive") == 2
+    assert "not on main" in capsys.readouterr().err and parked_wt.is_dir()
