@@ -1210,6 +1210,42 @@ def cmd_sort(view: View, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prompts(view: View, args: argparse.Namespace) -> int:
+    """Every prompt filed in Pending/ or Completed/, full paths by module; one whose status belongs in the other
+    folder (or in no folder yet) is flagged. 0 every file in its place, 1 something for `sort` to move."""
+    want = pc.PENDING_FOLDER if args.folder == "pending" else pc.COMPLETED_FOLDER
+    if args.module and args.module not in {m["module"] for m in view.modules}:
+        print(f"no prompts in module {args.module!r}; modules: " + ", ".join(m["module"] for m in view.modules), file=sys.stderr)
+        return 2
+    rows: dict[str, list[str]] = {}
+    misfiled = 0
+    live = pc.live_session_ids(view.sessions, view.now)
+    for p in view.prompts:
+        if p.legacy or (args.module and p.module != args.module) or (args.status and p.status not in args.status):
+            continue
+        filed = p.path.parent.name if p.path.parent.name in (pc.COMPLETED_FOLDER, pc.PENDING_FOLDER) else None
+        belongs = pc.status_folder(p.status)
+        if (filed or belongs) != want:
+            continue
+        note = ""
+        if filed != belongs:
+            if p.status == "running" and str(p.meta.get("session_id") or "") in live:
+                note = "  (live session: `sort` moves it later)"  # sort leaves it too
+            else:
+                note = f"  ⚠ not filed (belongs in {belongs}/)" if filed is None else f"  ⚠ belongs in {belongs}/"
+                misfiled += 1
+        rows.setdefault(p.module, []).append(f"  {pc.MARKS.get(p.status, '?')} {p.id or '-':<6} {p.status:<10} "
+                                             f"{p.path.resolve()}{note}")
+    total = sum(len(r) for r in rows.values())
+    print(f"{want}/ prompts · {total} in {len(rows)} modules" + (f" · {misfiled} misfiled" if misfiled else ""))
+    for module in sorted(rows):
+        print(f"\n{module} ({len(rows[module])})")
+        print("\n".join(rows[module]))
+    if misfiled:
+        print(f"\n{misfiled} prompt(s) out of place: `command_center.py sort` files them by status.")
+    return 1 if misfiled else 0
+
+
 # --- deploy-check ---------------------------------------------------------------------------------------
 
 DEPLOY_SECTIONS = (("live", "Live in every unit it needs"), ("half", "Half live"),
@@ -1864,6 +1900,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     rs = sub.add_parser("requests", help="the deploy requests: open, answered, held (--all: done too)")
     rs.add_argument("--all", action="store_true")
     rs.add_argument("--json", action="store_true")
+    pp = sub.add_parser("prompts", help="full paths of the prompts filed in Pending/ or Completed/; 1 if any is misfiled")
+    pp.add_argument("folder", choices=("pending", "completed"))
+    pp.add_argument("--module")
+    pp.add_argument("--status", action="append", choices=pc.STATUSES, help="only this status (repeatable)")
     so = sub.add_parser("sort", help="file every prompt under its module's Completed/ or Pending/ folder")
     so.add_argument("--dry-run", action="store_true")
     so.add_argument("--no-commit", action="store_true")
@@ -1890,6 +1930,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set(view, args)
     if args.cmd == "sort":
         return cmd_sort(view, args)
+    if args.cmd == "prompts":
+        return cmd_prompts(view, args)
     if args.cmd == "claim":
         return cmd_claim(view, args)
     if args.cmd == "deploy-check":
