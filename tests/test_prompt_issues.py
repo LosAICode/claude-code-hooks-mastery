@@ -100,9 +100,9 @@ def test_set_comment_posts_one_progress_comment(issues_proj, capsys):
 
 
 def test_set_done_closes_only_with_close(issues_proj, capsys):
-    assert run("set", "connections/R9", "done", "--no-commit") == 0
+    assert run("set", "connections/R9", "done", "--no-deploy", "fixture", "--proof", "fixture", "--no-commit") == 0
     assert CALLS == []
-    assert run("set", "connections/R7", "done", "--commit", "abc1234", "--notes", "live 10-30", "--close", "--no-commit") == 0
+    assert run("set", "connections/R7", "done", "--no-deploy", "fixture", "--proof", "fixture", "--commit", "abc1234", "--notes", "live 10-30", "--close", "--no-commit") == 0
     assert CALLS == [("issue", "close", "580", "--comment",
                                   "connections R7: pending → done · commit `abc1234` · live 10-30")]
 

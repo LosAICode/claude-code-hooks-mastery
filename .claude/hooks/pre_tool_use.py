@@ -25,6 +25,11 @@ try:
 except Exception:  # no gate rather than a broken hook
     verify_gate = None
 
+try:
+    from session_tracker import landing_guard
+except Exception:  # no guard rather than a broken hook
+    landing_guard = None
+
 def is_dangerous_rm_command(command):
     """
     Comprehensive detection of dangerous rm commands.
@@ -129,6 +134,14 @@ def main():
         if tool_name == 'Bash' and restart_gate is not None:  # restarts are requested from the /cc session (CC9)
             try:
                 reason = restart_gate(input_data, load_config())
+            except Exception:
+                reason = None
+            if reason:
+                print(reason, file=sys.stderr)
+                sys.exit(2)
+        if tool_name == 'Bash' and landing_guard is not None:  # no code lands on main mid-restart (CC14)
+            try:
+                reason = landing_guard(input_data, load_config())
             except Exception:
                 reason = None
             if reason:

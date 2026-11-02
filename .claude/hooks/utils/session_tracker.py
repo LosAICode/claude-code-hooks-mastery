@@ -437,7 +437,11 @@ def _snapshot_heads(data: dict[str, Any], payload: dict[str, Any], cfg: dict[str
         except GitError:
             pass  # not a checkout (yet): nothing to compare against
     if heads:
-        pending[_pending_key(payload, command)] = {"heads": heads, "ts": time.time()}
+        # CC14: only a git commit/merge/… lands; a command_center.py call (read-only, or its own status commit)
+        # snapshots the prompts repo too, and deploy-ready read that as "X is landing" (live 11-02, ×3)
+        landing = sorted(d for d, rules in _expected(command, cwd, data.get("worktree"), cfg).items()
+                         if d in heads and any(not r.get("status") for r in rules))
+        pending[_pending_key(payload, command)] = {"heads": heads, "landing": landing, "ts": time.time()}
     if pending or data.get("pending_heads"):
         data["pending_heads"] = pending
 
@@ -722,7 +726,7 @@ def apply_event(
         _snapshot_heads(data, payload, cfg, git)  # not a wait: a permission dialog arrives as PermissionRequest
     elif event in ("PreToolUse", "PermissionRequest"):
         _set_state(data, "waiting_on_owner", tool_summary(str(payload.get("tool_name") or ""), {}))
-    elif event == "PostToolUse":
+    elif event in ("PostToolUse", "PostToolUseFailure"):  # CC14: a failed command's snapshot read as "landing" 10 min
         _set_state(data, "working")
         name = str(payload.get("tool_name") or "")
         data["last_tool"] = tool_summary(name, dict(payload.get("tool_input") or {}))
@@ -928,6 +932,75 @@ def restart_gate(payload: dict[str, Any], cfg: dict[str, Any],
         return None
     except Exception as e:
         log_error("restart_gate", e)
+        return None
+
+
+# --- restart window (CC14) ----------------------------------------------------------------------------------
+
+RESTART_WINDOW_FILE = "/run/lock/neurogen-restart-window"  # the live config's prompts.restart_window
+DOCS_ONLY_PREFIXES = ("Documentation/", "reports/")
+_COMMIT_ALL = re.compile(r"\bcommit\b[^;&|]*?\s(?:-[a-zA-Z]*a[a-zA-Z]*|--all)(?=\s|$)")
+LANDING_BLOCK_REASON = (
+    "BLOCKED: a restart window is open ({why}; until {until}): no code commit or merge to main until the /cc session "
+    "says 'deploy done'. Docs-only commits ({docs}) still pass. Commit on your branch and land after. A stale window "
+    "(the deploy-run died) expires by itself; the /cc session can remove {path}."
+)
+
+
+def restart_window(cfg: dict[str, Any], now: float | None = None) -> dict[str, Any] | None:
+    """The open window ``deploy-run`` wrote (owner quote, units, expires), or None (no file, unreadable, expired)."""
+    spec = cfg.get("prompts")
+    path = str(spec.get("restart_window") or "") if isinstance(spec, dict) else ""
+    if not path:
+        return None  # off until the config names the file (tests never touch the live one)
+    try:
+        with open(path) as f:
+            win = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(win, dict) or (parse_iso(str(win.get("expires") or "")) or 0) <= (now or time.time()):
+        return None
+    return {**win, "path": path}
+
+
+def docs_only(files: list[str], prefixes: tuple[str, ...] = DOCS_ONLY_PREFIXES) -> bool:
+    return bool(files) and all(os.path.normpath(f).startswith(prefixes) for f in files)
+
+
+def landing_guard(payload: dict[str, Any], cfg: dict[str, Any], git: GitRunner = run_git) -> str | None:
+    """PreToolUse Bash: the block message for a code commit or merge to the prompts repo's main while a restart window
+    is open, else None. Never raises (fails open). Docs-only commits and branches other than main pass."""
+    try:
+        spec = cfg.get("prompts")
+        if not isinstance(spec, dict) or not spec.get("repo"):
+            return None
+        win = restart_window(cfg)
+        if not win:
+            return None
+        repo = os.path.realpath(str(spec["repo"]))
+        command = str((payload.get("tool_input") or {}).get("command") or "")
+        cwd = str(payload.get("cwd") or "")
+        prefixes = tuple(spec.get("docs_only_prefixes") or DOCS_ONLY_PREFIXES)
+        for git_dir, rules in _expected(command, cwd, None, cfg).items():
+            if os.path.realpath(git_dir) != repo or branch_of(git_dir, git) != "main":
+                continue
+            for rule in rules:
+                if rule.get("status"):
+                    continue  # command_center.py's own docs(prompts) commits
+                if "paths" in rule:  # a git commit: its pathspec, else what is staged
+                    files = [os.path.relpath(os.path.join(git_dir, f), repo) for f in rule.get("paths") or []]
+                    if not files:
+                        files = git(git_dir, "diff", "--cached", "--name-only")[1].splitlines()
+                        if _COMMIT_ALL.search(command):  # -a / --all also commits tracked edits not yet staged
+                            files += git(git_dir, "diff", "--name-only")[1].splitlines()
+                    if docs_only(files, prefixes):
+                        continue
+                why = str(win.get("owner_ok") or "deploy-run")[:80]
+                return LANDING_BLOCK_REASON.format(why=f"owner: {why}", until=win.get("expires"),
+                                                   docs=", ".join(prefixes), path=win["path"])
+        return None
+    except Exception as e:
+        log_error("landing_guard", e)
         return None
 
 

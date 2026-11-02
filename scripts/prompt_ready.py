@@ -29,6 +29,8 @@ import prompt_plan as pp
 
 MEMINFO = "/proc/meminfo"
 FREEZE_FILE = "/run/lock/neurogen-deploy-freeze"
+DOCS_ONLY_PREFIXES = ("Documentation/", "reports/")  # = session_tracker.DOCS_ONLY_PREFIXES (the landing guard)
+
 DEFAULTS = {"min_available_mb": 1500, "locks": [], "merge_state": True, "dirty_units": True, "migration_chain": True,
             "landing_window_min": 10, "main_line": True, "verify": True}
 STATUS_COMMIT_PREFIX = "docs(prompts):"  # command_center.py's own commits: they change no unit
@@ -172,13 +174,25 @@ def _needs_no_unit(repo: str, sha: str, umap: dict[str, Any] | None) -> bool:
     """A commit whose files the map sends to no unit (tests, docs); unreadable or unknown = it may need one."""
     if not umap:
         return False
+    files = _changed_files(repo, sha)
+    return bool(files) and pd.needs(files, umap) == (set(), False)
+
+
+def _changed_files(repo: str, sha: str) -> list[str]:
     try:
         p = subprocess.run(["git", "-C", repo, "show", "-z", "--name-only", "--format=", sha], capture_output=True,
                            text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
-        return False
-    files = [f for f in p.stdout.split("\0") if f.strip()] if p.returncode == 0 else []
-    return bool(files) and pd.needs(files, umap) == (set(), False)
+        return []
+    return [f for f in p.stdout.split("\0") if f.strip()] if p.returncode == 0 else []
+
+
+def _docs_only(repo: str, sha: str) -> bool:
+    """CC14: a commit touching only Documentation/ or reports/ (a register row, a prompt) never blocks a restart,
+    whatever the unit map says (live 11-02: two docs commits held the 11:36 and 12:20 restarts). A merge lists no
+    files here, so it always counts."""
+    files = _changed_files(repo, sha)
+    return bool(files) and all(f.startswith(DOCS_ONLY_PREFIXES) for f in files)
 
 
 def landing(sessions: list[dict[str, Any]], repo: str, now: float, window_min: float,
@@ -200,7 +214,8 @@ def landing(sessions: list[dict[str, Any]], repo: str, now: float, window_min: f
             continue
         who = str(s.get("name") or sid[:8])
         for snap in (s.get("pending_heads") or {}).values():
-            if (any(os.path.normpath(d) == target for d in (snap.get("heads") or {}))
+            dirs = snap["landing"] if "landing" in snap else (snap.get("heads") or {})  # CC14: git commit/merge only
+            if (any(os.path.normpath(d) == target for d in dirs)
                     and 0 <= now - float(snap.get("ts") or 0) <= window):
                 found.append(f"{who} is landing")
                 break
@@ -209,7 +224,8 @@ def landing(sessions: list[dict[str, Any]], repo: str, now: float, window_min: f
             if (when is None or os.path.normpath(str(c.get("dir") or "")) != target
                     or str(c.get("subject") or "").startswith(STATUS_COMMIT_PREFIX)):
                 continue
-            if 0 <= now - when <= window and not _needs_no_unit(repo, str(c.get("sha")), umap):
+            if 0 <= now - when <= window and not _docs_only(repo, str(c.get("sha"))) and not _needs_no_unit(
+                    repo, str(c.get("sha")), umap):
                 found.append(f"{who} landed {str(c.get('sha'))[:9]} {int((now - when) // 60)} min ago")
     return _check("no session landing", not found, "; ".join(dict.fromkeys(found)))
 

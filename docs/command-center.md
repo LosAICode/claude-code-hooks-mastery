@@ -70,7 +70,11 @@ python3 scripts/command_center.py --html          # write the HTML dashboard (pr
 python3 scripts/command_center.py set <ID|module/ID|file> <status> [--commit SHA]… [--deployed TS] [--notes TEXT] [--needs-owner TEXT] [--proof TEXT]
                                   [--tests FILE|TEXT [--tested SHA] | --no-tests WHY] [--progress N[/M] [text]]
                                   [--clear KEY]… [--comment] [--close] [--no-commit]
-python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand (running + session_id + its Stop gate)
+                                  done|skipped|superseded: [--dry-run] [--keep-worktree]; done: [--no-deploy WHY]
+python3 scripts/command_center.py claim <ref> --session SID [--no-commit]   # attach a live session by hand (running + session_id + its Stop gate),
+                                                                          # or take over an on-branch/on-main/deployed prompt (CC14)
+python3 scripts/command_center.py sbx-path [module/ID] [--session SID]     # /var/tmp/sbx-<module>-<ID>-<n> for a frozen sandbox copy (CC14)
+python3 scripts/command_center.py park <worktree> [--archive]             # parked commits -> archive/<branch>.patch, checked, then remove (CC14)
 python3 scripts/command_center.py deploy-check [--module M] [--json] [--apply [--no-commit]]
 python3 scripts/command_center.py issues [--module M] [--fix [--no-commit]]
 python3 scripts/command_center.py audit [--module M]      # exit 1 when it finds something
@@ -319,6 +323,42 @@ only the text between those markers: `**Prompts:** 🟢 9/12 done or deployed (�
 never written while the board has uncommitted edits (another session's lines would ride along in the pathspec commit);
 the command then says so and the next run catches up. `board-check` ignores the generated text.
 
+## Clean-up, disk report, restart window, handovers (CC14, 2026-11-02)
+
+- **Done = proven live.** `set <ref> done` is refused unless the prompt is `deployed` (or `--no-deploy "<why>"` for
+  docs or tooling no unit runs; it writes `deployed: none: <why>`) and has a `proof:` (or `--proof`). Live 11-02: M18
+  was set done while on main, and deploy-ready left its P0 fix out of "prompts to ship".
+- **Clean up on done.** `set … done|skipped|superseded`, after its commit, removes what the prompt left
+  (`scripts/prompt_cleanup.py`): each worktree a session holding the prompt worked in, or whose HEAD is one of its
+  `commits:` (or the branch side of a `--no-ff` landing merge), in the prompts repo and every `repos:` entry, then
+  `git branch -d` its branch, then `<sbx_root>/sbx-<module>-<ID>*`. A worktree goes only when its HEAD is an ancestor of
+  main, nothing is uncommitted, every untracked file is noise (`venv`, `__pycache__`, `.pytest_cache`,
+  `discovery_reports/`, `tests/browser/artifacts/`, …) or byte-identical on main, no process has its cwd or a file open
+  in it, and no other prompt's `proof:`/`tests:`/`notes:` names its path. Each REMOVE and KEEP prints its reason;
+  `--dry-run` shows the plan and writes nothing; `--keep-worktree` skips it. Never `-D`.
+- **Nightly disk report.** neurogenserver's `scripts/cleanup_dev_copies.py` (cron 04:30) applies the same rules to
+  `/var/lib/neurogen-worktrees`, deletes merged branches with no worktree (`-d`, tip older than 3 days), reads
+  `/var/tmp` + `/tmp` (report only, entries over 50 MB) and writes `disk_report.json`. `/cc` then shows a disk header
+  (`Disk · / 74% · /tmp 96% ⚠ · report 11-03 04:30`; ⚠ at / >= 85 %, /tmp >= 90 %) and **Parked, N GB**: worktrees with
+  unmerged commits untouched 7 days+, by prompt, oldest first. `park <worktree> --archive` (the owner's call per
+  branch) writes `git format-patch` of its commits to `<archive_dir>/<branch>.patch` (+ `.json` with the restore line),
+  applies it in a scratch worktree on its base and compares trees, and only then removes the worktree and `-D`s the
+  branch. It refuses a worktree with uncommitted edits or untracked files not on main.
+- **Sandbox copies.** Name a frozen copy `$(command_center.py sbx-path)` (`/var/tmp/sbx-<module>-<ID>-<n>`):
+  `run_sandboxed_tests.sh` removes it when its run ends (`--keep-root` keeps it for a rerun); `set … done` removes any
+  left.
+- **One restart window.** `deploy-run` writes `restart_window` (owner quote, units, expires +15 min) before its first
+  restart and removes it when the run ends, also on failure. Its `Tell:` lines tell every live session "restart window
+  open until HH:MM" and then "deploy done" (or "deploy stopped"). While the file is open and not expired, the
+  PreToolUse landing guard (`session_tracker.landing_guard`) refuses a `git commit`/`merge`/`cherry-pick`/`revert`/`am`
+  on the prompts repo's main unless the commit touches only `Documentation/` or `reports/` (its pathspec, else what is
+  staged); branches and worktrees pass. In `deploy-ready`'s "no session landing", a docs-only commit never counts
+  (whatever the unit map says), a `command_center.py` call never counts as "is landing" (only a git commit/merge
+  snapshot does), and a command that fails closes its snapshot (PostToolUseFailure).
+- **Handovers.** `claim <ref> --session SID` on an `on-branch`/`on-main`/`deployed` prompt is a takeover: the status
+  stays, `session_id` becomes the new session and the old one goes into `previous_sessions:`, so `deploy-run`'s and
+  `deploy-check`'s `Tell:` lines reach the new session. Refused while the old session is live.
+
 ## What the hooks do
 
 - **Claim.** On any message that names a prompt file while the session holds no prompt (CC8: not only the first; a
@@ -396,6 +436,9 @@ The `prompts` block of `~/.claude/session-tracker/config.json` (template: `.clau
 | `deploy_coordinator` | `{"session": "<id or ≥8-char prefix>"}`: the `/cc` session whose restarts pass the restart gate; unset = the gate is off |
 | `repos` | (CC11) other repos a prompt's `commits:` may name: `[{"name", "path", "live_at_merge", "branch"}]` (see Commits in a second repo) |
 | `main_line_days` | (CC11) how far back `audit` and `deploy-ready` look for main fast-forwarded to a branch that merged main (default 3) |
+| `restart_window` | (CC14) the restart-window file `deploy-run` writes and the landing guard reads (live: `/run/lock/neurogen-restart-window`); unset = no window |
+| `disk_report` | (CC14) the nightly `disk_report.json` (live: `/var/lib/neurogen-ops/disk_report.json`); unset = no disk header / Parked GB |
+| `sbx_root`, `archive_dir` | (CC14) where `sbx-<module>-<ID>-<n>` copies live (default `/var/tmp`); where `park` writes patches (default `/var/lib/neurogen-ops/archive`) |
 | `prod_revision` | `deploy-plan`: a read-only shell query printing prod's `alembic_version` head(s), e.g. `psql -h 127.0.0.1 -U postgres -d neurogenserver -tAc 'SELECT version_num FROM alembic_version'`; unset = "alembic_version unread" |
 
 ## Migration
