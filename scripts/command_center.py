@@ -1440,6 +1440,54 @@ def apply_live(view: View, results: list[dict[str, Any]], no_commit: bool) -> li
     return [e["rel"] for e in ready]
 
 
+def _live_others(view: View) -> list[str]:
+    """Every live session but this one, as ``name (sid8)``."""
+    own = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    live = pc.live_session_ids(view.sessions, view.now)
+    by_sid = {str(s["session_id"]): s for s in view.sessions}
+    return [f"{by_sid[s].get('name')} ({s[:8]})" if by_sid[s].get("name") else s[:8]
+            for s in sorted(live) if not (own and s.startswith(own[:8]))]
+
+
+def open_window(view: View, owner_ok: str, units: list[str], minutes: int = 15) -> str | None:
+    """CC14 Do 4: write the restart window (owner quote, units, expires) that the hooks' landing guard reads: no code
+    commit or merge to main until it closes. Tell every live session. Returns its path (None: not written)."""
+    path = str(view.spec.get("restart_window") or "")
+    if not path:
+        return None  # off until prompts.restart_window names the file (the live config: /run/lock/neurogen-restart-window)
+    until = datetime.fromtimestamp(time.time() + minutes * 60).astimezone()
+    win = {"owner_ok": owner_ok, "units": list(units), "opened": datetime.now().astimezone().isoformat(timespec="seconds"),
+           "expires": until.isoformat(timespec="seconds"), "pid": os.getpid()}
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(win, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"restart window NOT opened ({e}): landings are not held during this run", file=sys.stderr)
+        return None
+    print(f"restart window open until {until:%H:%M} ({path}): code commits and merges to main are refused, docs pass")
+    for who in _live_others(view):
+        print(f"Tell: {who} · restart window open until {until:%H:%M}: no code commits to main until 'deploy done'")
+    return path
+
+
+def close_window(view: View, path: str | None, done: bool) -> None:
+    """Remove the window (also when a step failed) and tell every live session."""
+    if path is None:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"restart window NOT removed ({e}): remove {path} by hand; it expires by itself", file=sys.stderr)
+    word = "deploy done" if done else "deploy stopped (a step failed); window closed"
+    print("")
+    for who in _live_others(view):
+        print(f"Tell: {who} · {word}: commits to main are open again")
+
+
 def tell_lines(view: View, rels: list[str]) -> list[str]:
     """Who to tell that their prompt is live, and what proof it owes: the session in its frontmatter, if live.
     The /cc session sends each line with SendMessage (CC9: peers asked "is it live?" by hand)."""
@@ -1722,13 +1770,23 @@ def cmd_deploy_run(view: View, args: argparse.Namespace) -> int:
         return 3
     if not plan["steps"]:
         print("\nnothing to restart: every needed unit already runs these commits")
-        rec = None
-    else:
+        return _deploy_run_tail(view, args, umap, None)
+    window = open_window(view, owner_ok, plan["units"])
+    code = 1
+    try:
         print("")
         code, rec = prun.execute(plan, umap, str(view.spec["repo"]), owner_ok)
         if code:
             print(f"\nThen: fix it, `{me} deploy-plan`, and rerun the rest with --only <step>.")
             return code
+        return _deploy_run_tail(view, args, umap, rec)
+    finally:
+        close_window(view, window, done=code == 0)
+
+
+def _deploy_run_tail(view: View, args: argparse.Namespace, umap: dict, rec: dict | None) -> int:
+    import prompt_run as prun
+
     rels: list[str] = []
     try:
         import prompt_deploy as pd

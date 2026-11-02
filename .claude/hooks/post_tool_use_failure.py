@@ -12,6 +12,13 @@ from datetime import datetime
 from pathlib import Path
 
 try:
+    sys.path.insert(0, str(Path(__file__).parent / "utils"))
+    from session_tracker import track
+except Exception:  # the session tracker must never break this hook
+    def track(event, payload):
+        return None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -22,6 +29,7 @@ def main():
     try:
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
+        track("PostToolUseFailure", input_data)  # closes the command's HEAD snapshot (CC14)
 
         # Add timestamp to the log entry
         input_data['logged_at'] = datetime.now().isoformat()

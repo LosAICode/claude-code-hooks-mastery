@@ -195,3 +195,135 @@ def test_untracked_noise_and_files_identical_on_main_do_not_keep_a_worktree(tmp_
     assert pcl.untracked_not_on_main(str(w)) == []
     (w / "tests" / "t.py").write_text("changed\n")
     assert pcl.untracked_not_on_main(str(w)) == ["tests/t.py"]
+
+
+# --- Do 4: one restart window ----------------------------------------------------------------------------
+
+from conftest import commit_file  # noqa: E402
+from test_command_center_cc9 import FAKE_RESTART_WEB, checks_of, fake_of, iso, set_map  # noqa: E402
+
+OTHER = "dddd4444-0000-0000-0000-000000000004"
+
+
+def test_a_docs_only_commit_never_blocks_a_restart_but_a_code_one_does(box, capsys, tmp_path):
+    # whatever the map says: here a catch-all rule sends Documentation/ to web too
+    set_map(box, tmp_path, lambda m: m["rules"].append({"paths": ["**"], "units": ["web"]}))
+    doc = commit_file(box, "Documentation/Security/Register.md", "row", "security: register row M18")
+    rows = [{"sha": doc, "subject": "security: register row M18", "repo": "r", "dir": str(box), "ts": iso(2)}]
+    write_sessions(tmp_path / "tracker", [session(OTHER, seen=1, commits=rows)])
+    _code, checks, _ = checks_of(capsys)
+    assert checks["no session landing"]["ok"], checks["no session landing"]
+    code_sha = commit_file(box, "modules/services/w.py", "w", "fix: w")
+    rows.append({"sha": code_sha, "subject": "fix: w", "repo": "r", "dir": str(box), "ts": iso(1)})
+    write_sessions(tmp_path / "tracker", [session(OTHER, seen=1, commits=rows)])
+    _code, checks, _ = checks_of(capsys)
+    assert not checks["no session landing"]["ok"] and code_sha[:9] in checks["no session landing"]["detail"]
+
+
+def test_a_command_center_snapshot_is_not_a_landing_a_git_merge_one_is(box, capsys, tmp_path):
+    t = datetime.fromisoformat(NOW).timestamp() - 60
+    head = git(box, "rev-parse", "HEAD")
+    claim = {"heads": {str(box): head}, "landing": [], "ts": t}
+    write_sessions(tmp_path / "tracker", [session(OTHER, seen=1, pending_heads={"t1": claim})])
+    _code, checks, _ = checks_of(capsys)
+    assert checks["no session landing"]["ok"], checks["no session landing"]
+    merge = {"heads": {str(box): head}, "landing": [str(box)], "ts": t}
+    write_sessions(tmp_path / "tracker", [session(OTHER, seen=1, pending_heads={"t2": merge})])
+    _code, checks, _ = checks_of(capsys)
+    assert not checks["no session landing"]["ok"] and "is landing" in checks["no session landing"]["detail"]
+
+
+def test_the_snapshot_names_only_git_landings(box):
+    import session_tracker as st
+
+    cfg = st.load_config()
+    for command, landing in (("python3 /x/scripts/command_center.py deploy-ready", []),
+                             (f"cd {box} && git merge --no-ff a1-work", [str(box)])):
+        data = {"session_id": OTHER}
+        st._snapshot_heads(data, {"tool_input": {"command": command}, "cwd": str(box), "tool_use_id": "t"}, cfg,
+                           st.run_git)
+        assert data["pending_heads"]["t"]["landing"] == landing, command
+
+
+def test_a_failed_command_closes_its_snapshot(box):
+    import session_tracker as st
+
+    cfg = st.load_config()
+    payload = {"session_id": OTHER, "tool_name": "Bash", "tool_use_id": "t9", "cwd": str(box),
+               "tool_input": {"command": f"cd {box} && git merge --no-ff nope"}}
+    data = {"session_id": OTHER}
+    st.apply_event(data, "PreToolUse", payload, cfg)
+    assert "t9" in data["pending_heads"]
+    st.apply_event(data, "PostToolUseFailure", payload, cfg)
+    assert "t9" not in (data.get("pending_heads") or {})
+
+
+@pytest.fixture
+def window(box, tmp_path):
+    """The live tree `box` on main, the window file configured in tmp and open."""
+    import datetime as dt
+
+    path = tmp_path / "restart-window"
+    c = json.loads((tmp_path / "config.json").read_text())
+    c["prompts"]["restart_window"] = str(path)
+    (tmp_path / "config.json").write_text(json.dumps(c))
+    until = (dt.datetime.now().astimezone() + dt.timedelta(minutes=10)).isoformat(timespec="seconds")
+    path.write_text(json.dumps({"owner_ok": "ship A09", "units": ["app"], "expires": until}))
+    return path
+
+
+def guard(box, command, cwd=None):
+    import session_tracker as st
+
+    return st.landing_guard({"tool_input": {"command": command}, "cwd": str(cwd or box)}, st.load_config())
+
+
+def test_the_guard_refuses_a_code_merge_or_commit_to_main_while_the_window_is_open(box, window, tmp_path):
+    assert "restart window is open" in guard(box, f"cd {box} && git merge --no-ff a1-work")
+    (box / "modules" / "x.py").parent.mkdir(exist_ok=True)
+    (box / "modules" / "x.py").write_text("x")
+    git(box, "add", "modules/x.py")
+    assert guard(box, 'git commit -m "fix: x"')
+    assert guard(box, 'git commit -m "fix: x" -- modules/x.py')
+
+
+def test_the_guard_passes_docs_commits_branches_and_closed_windows(box, window, tmp_path):
+    (box / "Documentation").mkdir(exist_ok=True)
+    (box / "Documentation" / "r.md").write_text("row")
+    git(box, "add", "Documentation/r.md")
+    assert guard(box, 'git commit -m "docs: row"') is None
+    assert guard(box, 'git commit -m "docs: row" -- Documentation/r.md') is None
+    assert guard(box, "python3 /x/scripts/command_center.py set agents/A1 deployed") is None
+    git(box, "worktree", "add", "-q", "-b", "side", str(tmp_path / "side"))
+    assert guard(box, 'git commit -m "fix: y"', cwd=tmp_path / "side") is None
+    window.write_text(json.dumps({"owner_ok": "x", "expires": "2026-01-01T00:00:00+00:00"}))  # expired
+    assert guard(box, f"cd {box} && git merge --no-ff a1-work") is None
+    window.unlink()
+    assert guard(box, f"cd {box} && git merge --no-ff a1-work") is None
+
+
+def test_the_guard_is_off_without_the_config_key(box, tmp_path):
+    assert guard(box, f"cd {box} && git merge --no-ff a1-work") is None
+
+
+def test_deploy_run_opens_the_window_for_its_restarts_and_closes_it(box, window, capsys, tmp_path):
+    window.unlink()
+    (fake_of(tmp_path) / "restart_web.sh").write_text(
+        FAKE_RESTART_WEB + f'cat {window} > {tmp_path / "state" / "window_seen"}\n')
+    sessions(box, session(LIVE_SID, name="a04b-lander", seen=1), session(OTHER, name="assistants", seen=1))
+    assert run("deploy-run", "--owner-ok", "owner: ship A1", "--no-commit") == 0
+    out = capsys.readouterr().out
+    seen = json.loads((tmp_path / "state" / "window_seen").read_text())
+    assert seen["owner_ok"] == "owner: ship A1" and "app" in seen["units"]
+    assert not window.exists()
+    assert "Tell: assistants (dddd4444) · restart window open until" in out
+    assert "Tell: assistants (dddd4444) · deploy done" in out
+
+
+def test_a_failed_deploy_run_still_closes_the_window(box, window, capsys, tmp_path):
+    window.unlink()
+    (fake_of(tmp_path) / "restart_web.sh").write_text("#!/bin/sh\nexit 1\n")
+    sessions(box, session(OTHER, name="assistants", seen=1))
+    assert run("deploy-run", "--owner-ok", "go", "--no-commit") != 0
+    assert not window.exists()
+    assert "deploy stopped" in capsys.readouterr().out
