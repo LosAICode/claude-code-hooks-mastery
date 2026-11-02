@@ -1214,6 +1214,7 @@ def cmd_prompts(view: View, args: argparse.Namespace) -> int:
     """Every prompt filed in Pending/ or Completed/, full paths by module; one whose status belongs in the other
     folder (or in no folder yet) is flagged. 0 every file in its place, 1 something for `sort` to move."""
     want = pc.PENDING_FOLDER if args.folder == "pending" else pc.COMPLETED_FOLDER
+    args.module = args.module.lower() if args.module else None  # `Agents` as typed in /cc-prompts-pending
     if args.module and args.module not in {m["module"] for m in view.modules}:
         print(f"no prompts in module {args.module!r}; modules: " + ", ".join(m["module"] for m in view.modules), file=sys.stderr)
         return 2

@@ -77,7 +77,7 @@ python3 scripts/command_center.py audit [--module M]      # exit 1 when it finds
 python3 scripts/command_center.py board-check             # the hand-written Status Board vs the prompts; exit 1 on a mismatch
 python3 scripts/command_center.py board-markers [--no-commit]   # once: a generated Prompts: line in each module's board row
 python3 scripts/command_center.py sort [--dry-run] [--no-commit]   # file every prompt under Completed/ or Pending/
-python3 scripts/command_center.py prompts pending|completed [--module M] [--status S]  # full paths by module; 1 = a prompt misfiled (/cc-module-prompts-pending, /cc-module-prompts-completed)
+python3 scripts/command_center.py prompts pending|completed [--module M] [--status S]  # full paths by module; 1 = a prompt misfiled (/cc-prompts-pending [module], /cc-prompts-completed [module])
 python3 scripts/command_center.py inbox [--module M] [--json]        # every open owner ask, longest waiting first
 python3 scripts/command_center.py deploy-plan [--module M] [--json]  # guards, migrations, restart order, proofs: prints, runs nothing
 python3 scripts/command_center.py deploy-ready [--module M] [--json] # OK or WAIT with every reason, and what would ship; exit 0/1

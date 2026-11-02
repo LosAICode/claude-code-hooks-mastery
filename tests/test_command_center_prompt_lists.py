@@ -34,7 +34,7 @@ def test_a_done_prompt_left_in_pending_is_flagged(tree, capsys):
 
 
 def test_module_and_status_narrow_the_list(tree, capsys):
-    run("prompts", "pending", "--module", "comms")
+    run("prompts", "pending", "--module", "Comms")
     out = capsys.readouterr().out
     assert "Comms-C1-Dial.md" in out and "Alpha-" not in out
     run("prompts", "pending", "--status", "on-main")

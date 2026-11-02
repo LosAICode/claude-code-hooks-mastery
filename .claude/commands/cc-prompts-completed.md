@@ -4,7 +4,7 @@ allowed-tools: Bash(python3 /opt/claude-code-hooks-mastery/scripts/command_cente
 ---
 
 Run `python3 /opt/claude-code-hooks-mastery/scripts/command_center.py prompts completed`, adding `--module <name>` when
-$ARGUMENTS starts with a bare module name (e.g. `assistants`) and passing any other flags in $ARGUMENTS as is:
+$ARGUMENTS starts with a bare module name (e.g. `agents` or `Agents`: `/cc-prompts-completed agents`) and passing any other flags in $ARGUMENTS as is:
 
 $ARGUMENTS
 
